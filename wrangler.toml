@@ -1,0 +1,30 @@
+# Cloudflare Pages configuration.
+#
+# The SUMMARIES KV namespace holds ALL durable state, in three kinds of keys:
+#   • `sum:r*:<episodeId>` — the GLOBAL summary cache: once any user processes
+#     an episode, the result is stored here and reused by every other user
+#     (no repeat transcription / LLM calls).
+#   • `u:<uid>:channels:v1` / `u:<uid>:processed:v1` — PER-USER roster and
+#     processed history for Munshot-identified visitors (see server/identity.ts).
+#   • `channels:v1` — the legacy/global roster, still serving anonymous visits.
+# The /api/summary, /api/episodes, /api/channels and /api/processed Functions
+# read it as `env.SUMMARIES`.
+#
+# One-time setup (creates the namespace and prints its id):
+#   npx wrangler kv namespace create SUMMARIES
+# Paste the printed id below, then deploy. If you deploy via the Pages dashboard
+# (Git integration) instead of `wrangler pages deploy`, you can alternatively bind
+# it under: Settings → Functions → KV namespace bindings → variable `SUMMARIES`.
+#
+# Local `vite dev` does NOT use KV — it uses a filesystem store under .cache/ —
+# so no binding is needed for local development.
+
+# NOTE: `name` must match the Pages project name exactly — the Git-integrated
+# build validates this file and fails the whole deploy on a mismatch (or on a
+# missing KV id), leaving production stuck on the last good build.
+name = "beaspodcast"
+pages_build_output_dir = "dist"
+
+[[kv_namespaces]]
+binding = "SUMMARIES"
+id = "8fe16c83a9dd4193b5c5685faf60569a"

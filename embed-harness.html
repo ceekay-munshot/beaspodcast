@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Embed harness — chat.muns.io sandbox replica</title>
+    <!--
+      Reproduces EXACTLY how chat.muns.io/dashboards embeds this app: an iframe
+      sandboxed WITHOUT allow-popups-to-escape-sandbox (attribute copied verbatim
+      from the live dashboard DOM). Anything that opens a popup/tab from inside
+      dies there with ERR_BLOCKED_BY_RESPONSE on header-strict sites (YouTube),
+      so in-app flows (the Watch on YouTube modal) must be tested under these
+      flags. Open http://localhost:5173/embed-harness.html during `vite dev`.
+      Dev-only: not a rollup input, so it never ships in dist/.
+
+      It also plays the HOST half of the Munshot Dashboard SDK envelope protocol
+      (the SDK script is the dashboard-side client; a host speaks the wire
+      format). The handshake is HOST-initiated: the harness picks a channelId
+      and sends `host:init` with the selected mock user's context — retrying
+      until the SDK client acks with `dashboard:ready` (and re-sending whenever
+      the app proactively announces ready, which covers the app-bundle-races-
+      iframe-load case). Switching users mid-session sends
+      `host:context:update` WITHOUT reloading the iframe — exactly the
+      transition the app must survive. "Silent host" suppresses init entirely
+      to prove the app's anonymous-fallback timeout.
+    -->
+    <style>
+      :root {
+        --bg: #f9fafb;
+        --surface: #ffffff;
+        --border: #e5e7eb;
+        --text: #111827;
+        --muted: #6b7280;
+        --hint: #9ca3af;
+        --primary: #4f46e5;
+        --primary-soft: #eef2ff;
+        --primary-border: #e0e7ff;
+        --primary-text: #4338ca;
+        --ease: cubic-bezier(0.23, 1, 0.32, 1);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        background: var(--bg);
+        font-family: system-ui, -apple-system, sans-serif;
+        color: var(--text);
+      }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        padding: 8px 12px;
+        background: rgba(255, 255, 255, 0.95);
+        border-bottom: 1px solid var(--border);
+        backdrop-filter: blur(8px);
+        flex-shrink: 0;
+      }
+      .label {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: var(--hint);
+        margin-right: 2px;
+      }
+      .chip {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text);
+        font: 600 12px/1 system-ui, -apple-system, sans-serif;
+        padding: 7px 12px;
+        border-radius: 99px;
+        cursor: pointer;
+        transition:
+          transform 0.15s var(--ease),
+          opacity 0.15s var(--ease);
+      }
+      .chip:active {
+        transform: scale(0.97);
+      }
+      .chip[aria-pressed='true'] {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: #fff;
+      }
+      .chip.ghost {
+        color: var(--muted);
+      }
+      .chip:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      @media (hover: hover) and (pointer: fine) {
+        .chip:not([aria-pressed='true']):not(:disabled):hover {
+          border-color: var(--primary);
+          color: var(--primary-text);
+        }
+      }
+      .custom {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .custom input {
+        width: 150px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 6px 9px;
+        font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--text);
+        background: var(--surface);
+        outline: none;
+        transition: opacity 0.15s var(--ease);
+      }
+      .custom input:focus {
+        border-color: var(--primary);
+        box-shadow: 0 0 0 3px var(--primary-soft);
+      }
+      .custom input::placeholder {
+        color: var(--hint);
+      }
+      .toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--muted);
+        cursor: pointer;
+        user-select: none;
+      }
+      .toggle input {
+        accent-color: var(--primary);
+        margin: 0;
+      }
+      .spacer {
+        flex: 1;
+      }
+      .status {
+        font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--muted);
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 5px 9px;
+        max-width: 340px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .status .pill {
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--hint);
+        margin-right: 6px;
+        vertical-align: 1px;
+      }
+      .status.live .pill {
+        background: #16a34a;
+      }
+      details.log {
+        flex-basis: 100%;
+        font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--muted);
+      }
+      details.log summary {
+        cursor: pointer;
+        color: var(--hint);
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      details.log ol {
+        margin: 6px 0 2px;
+        padding: 8px 10px 8px 26px;
+        max-height: 130px;
+        overflow: auto;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+      }
+      details.log li {
+        white-space: nowrap;
+      }
+      iframe {
+        width: 100%;
+        flex: 1;
+        border: 0;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .chip,
+        .custom input {
+          transition: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="toolbar">
+      <span class="label">Host</span>
+      <span id="users"></span>
+      <button class="chip ghost" id="signout" type="button" title="host:context:update with an empty context">Sign out</button>
+      <form class="custom" id="customForm">
+        <input id="customId" type="text" placeholder="custom userId…" autocomplete="off" spellcheck="false" />
+        <button class="chip" id="customGo" type="submit" disabled>Switch</button>
+      </form>
+      <label class="toggle" title="Don't answer dashboard:ready — proves the app's anonymous fallback (reloads the iframe)">
+        <input type="checkbox" id="silent" /> Silent host
+      </label>
+      <button class="chip ghost" id="reload" type="button">Reload iframe</button>
+      <span class="spacer"></span>
+      <span class="status" id="status"><span class="pill"></span>waiting for dashboard:ready…</span>
+      <details class="log">
+        <summary>Message log</summary>
+        <ol id="log"></ol>
+      </details>
+    </div>
+
+    <iframe
+      id="app"
+      src="/"
+      title="Munshot Podcasts"
+      sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-downloads"
+    ></iframe>
+
+    <script>
+      // ── The host half of the Munshot Dashboard SDK envelope protocol ───────
+      const NAMESPACE = 'munshot-dashboard-sdk'
+      const VERSION = '1.0.0'
+
+      const USERS = [
+        { userId: 'usr_asha_01', email: 'asha@muns.io', name: 'Asha Iyer', orgId: 'org_muns' },
+        { userId: 'usr_rohan_02', email: 'rohan@muns.io', name: 'Rohan Mehta', orgId: 'org_muns' },
+        // No userId on purpose — exercises the app's email-fallback identity.
+        { email: 'legacy@muns.io', name: 'Email-only (no userId)' },
+      ]
+
+      const iframe = document.getElementById('app')
+      const statusEl = document.getElementById('status')
+      const logEl = document.getElementById('log')
+      const usersEl = document.getElementById('users')
+      const customInput = document.getElementById('customId')
+      const customGo = document.getElementById('customGo')
+      const silentEl = document.getElementById('silent')
+
+      // HOST-initiated handshake (mirrors the real SDK): we pick the channelId,
+      // send host:init, and keep nudging until the SDK client acks with
+      // dashboard:ready carrying OUR channelId.
+      let channelId = newChannelId()
+      let acked = false
+      let retryTimer = null
+      let currentUser = USERS[0] // the context host:init / updates carry; null = signed out
+
+      const chips = USERS.map((u, i) => {
+        const b = document.createElement('button')
+        b.type = 'button'
+        b.className = 'chip'
+        b.textContent = u.name
+        b.title = u.userId ?? u.email
+        b.setAttribute('aria-pressed', String(i === 0))
+        b.addEventListener('click', () => switchTo(u, b))
+        usersEl.appendChild(b)
+        return b
+      })
+
+      function newChannelId() {
+        return typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `harness-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      }
+
+      function markActive(activeChip) {
+        for (const c of chips) c.setAttribute('aria-pressed', String(c === activeChip))
+      }
+
+      function userLabel() {
+        return currentUser ? (currentUser.userId ?? currentUser.email) : 'signed out'
+      }
+
+      function switchTo(user, chip) {
+        currentUser = user
+        markActive(chip ?? null)
+        // Mid-session switch = host:context:update, NO iframe reload — that
+        // transition (clean refetch, no data bleed) is what's under test.
+        if (acked) {
+          send('host:context:update', { context: user ?? {} })
+          setStatus(`context:update sent (${userLabel()})`)
+        } else {
+          setStatus(`queued for init (${userLabel()})`, false)
+        }
+      }
+
+      document.getElementById('signout').addEventListener('click', () => switchTo(null, null))
+
+      customInput.addEventListener('input', () => {
+        customGo.disabled = !customInput.value.trim()
+      })
+      document.getElementById('customForm').addEventListener('submit', (e) => {
+        e.preventDefault()
+        const id = customInput.value.trim()
+        if (!id) return
+        switchTo({ userId: id, name: id }, null)
+      })
+
+      // The handshake happens at dashboard boot, so silencing the host only
+      // takes effect on a fresh load — reload to make the toggle truthful.
+      silentEl.addEventListener('change', reload)
+      document.getElementById('reload').addEventListener('click', reload)
+      function reload() {
+        iframe.src = '/'
+      }
+
+      // Fresh channel per iframe load; begin courting the dashboard.
+      iframe.addEventListener('load', () => {
+        channelId = newChannelId()
+        acked = false
+        clearInterval(retryTimer)
+        if (silentEl.checked) {
+          setStatus('silent — never sending host:init (tests anonymous fallback)', false)
+          return
+        }
+        setStatus('sending host:init…', false)
+        sendInit()
+        // Retry until acked: covers the app bundle still loading when the
+        // iframe's load event fired (exactly what a real host does).
+        let tries = 0
+        retryTimer = setInterval(() => {
+          if (acked || ++tries > 40) {
+            clearInterval(retryTimer)
+            return
+          }
+          sendInit()
+        }, 400)
+      })
+
+      window.addEventListener('message', (e) => {
+        const m = e.data
+        if (!m || m.namespace !== NAMESPACE || m.source !== 'dashboard') return
+        if (e.source !== iframe.contentWindow) return // only OUR iframe may speak
+        log('◀', m.kind, m.payload)
+        if (m.kind === 'dashboard:ready') {
+          if (m.channelId === channelId) {
+            // The SDK client ack — channel established.
+            if (!acked) {
+              acked = true
+              clearInterval(retryTimer)
+              setStatus(`connected — init delivered (${userLabel()})`)
+            }
+          } else if (!silentEl.checked) {
+            // A proactive announce (channelId "pending-channel"): the client
+            // just came up and wants an init — oblige immediately.
+            sendInit()
+          } else {
+            setStatus('dashboard announced ready — staying silent', false)
+          }
+        }
+      })
+
+      function sendInit() {
+        send('host:init', { context: currentUser ?? {} })
+      }
+
+      function send(kind, payload) {
+        if (!iframe.contentWindow) return
+        const envelope = {
+          namespace: NAMESPACE,
+          version: VERSION,
+          channelId,
+          source: 'host',
+          kind,
+          timestamp: Date.now(),
+          payload,
+        }
+        iframe.contentWindow.postMessage(envelope, window.location.origin)
+        log('▶', kind, payload)
+      }
+
+      function setStatus(text, live = true) {
+        statusEl.classList.toggle('live', live)
+        statusEl.innerHTML = '<span class="pill"></span>'
+        statusEl.appendChild(document.createTextNode(text))
+        statusEl.title = text
+      }
+
+      function log(dir, kind, payload) {
+        const li = document.createElement('li')
+        let detail = ''
+        try {
+          detail = payload ? ` ${JSON.stringify(payload)}` : ''
+        } catch {
+          detail = ' [unserializable]'
+        }
+        li.textContent = `${dir} ${kind}${detail}`
+        logEl.appendChild(li)
+        while (logEl.children.length > 60) logEl.removeChild(logEl.firstChild)
+        li.scrollIntoView({ block: 'nearest' })
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+{
+  // Typechecks the code tsconfig.json's "include": ["src"] leaves out: the shared
+  // server modules, the Cloudflare Pages Functions, and the Vite config. These run
+  // on Node (dev) / Workers (prod), so they need Node globals (process, node:*) on
+  // top of the Web APIs (fetch/Response/URL/…) inherited from the base "DOM" lib.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["server/**/*.ts", "functions/**/*.ts", "vite.config.ts"]
+}
