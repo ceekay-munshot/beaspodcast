@@ -70,6 +70,56 @@ export const onRequestGet = async (context: { request: Request; env: TranscribeH
     keyDetail = `Could not reach Deepgram: ${scrub(String(e), key)}`
   }
 
+  // ── 2b. Optionally perform the REAL Deepgram call (?run=1) ────────────────
+  // The definitive test. server/transcribe.ts makes exactly this request and
+  // throws the answer away on failure; here we surface the status and error body
+  // instead. This one does spend a little credit, so it is opt-in.
+  const params = new URL(context.request.url).searchParams
+  if (audioUrl && params.get('run') === '1') {
+    const model = params.get('model') || 'nova-3'
+    const q = new URLSearchParams({ model, smart_format: 'true', punctuate: 'true', utterances: 'true', diarize: 'true', language: 'en' })
+    const started = Date.now()
+    try {
+      const res = await fetch(`https://api.deepgram.com/v1/listen?${q.toString()}`, {
+        method: 'POST',
+        headers: { authorization: `Token ${key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ url: audioUrl }),
+      })
+      const ms = Date.now() - started
+      if (!res.ok) {
+        return json(502, {
+          ok: false,
+          stage: 'deepgram_transcribe',
+          model,
+          status: res.status,
+          ms,
+          // The exact reason server/transcribe.ts discards. Common causes:
+          // 400 = model not available on this plan / bad request, 402 = out of
+          // credit, 403 = key lacks permission, 404 = audio URL rejected.
+          detail: scrub(await res.text().catch(() => ''), key) || `Deepgram returned ${res.status}.`,
+        })
+      }
+      const data = (await res.json()) as {
+        results?: { utterances?: Array<unknown>; channels?: Array<{ alternatives?: Array<{ transcript?: string }> }> }
+      }
+      const text = data.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? ''
+      return json(200, {
+        ok: true,
+        stage: 'deepgram_transcribe',
+        model,
+        status: res.status,
+        ms,
+        utterances: data.results?.utterances?.length ?? 0,
+        transcriptChars: text.length,
+        // server/transcribe.ts only accepts a transcript longer than 200 chars.
+        wouldBeAccepted: text.length > 200,
+        preview: text.slice(0, 200),
+      })
+    } catch (e) {
+      return json(502, { ok: false, stage: 'deepgram_transcribe', model, ms: Date.now() - started, detail: scrub(String(e), key) })
+    }
+  }
+
   // ── 2. Optionally check the episode audio is actually fetchable ────────────
   let audio: Record<string, unknown> | undefined
   if (audioUrl) {
