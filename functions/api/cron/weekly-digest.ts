@@ -1,5 +1,6 @@
 import { getLiveEpisodes } from '../../../server/feeds'
 import { kvSummaryStore, type KVNamespace } from '../../../server/summaryStore'
+import { llmConfigFromEnv, type LlmEnv } from '../../../server/llmConfig'
 import { kvSubscriberStore } from '../../../server/subscriberStore'
 import { kvReportStore, reportUrl } from '../../../server/reportStore'
 import { checkCronAuth, processPendingBatch, runWeeklyDigest } from '../../../server/weeklyDigest'
@@ -18,20 +19,14 @@ import { weeklyPdfBytes } from '../../../src/lib/pdfRender'
 //   MUNSHOT_EMAIL_TOKEN— service token for server-to-server sends. There is no
 //                        user session in a cron, so the raw-email endpoint must
 //                        accept this token; without it, sends will be rejected.
-interface CronEnv {
+interface CronEnv extends LlmEnv {
   SUMMARIES?: KVNamespace
   CRON_SECRET?: string
   MUNSHOT_EMAIL_TOKEN?: string
   // LLM keys (already on this Pages project for /api/summary) — let the digest run
-  // the SAME cross-episode synthesis the on-screen weekly uses.
-  OPENAI_API_KEY?: string
-  ANTHROPIC_API_KEY?: string
-  SUMMARY_MODEL?: string
-  // Claude/Bedrock toggle — mirrors /api/summary; defaults to "openai".
-  LLM_PROVIDER?: string
-  temp_claude_token?: string
-  AWS_BEDROCK_REGION?: string
-  AWS_BEDROCK_MODEL_ID?: string
+  // the SAME cross-episode synthesis the on-screen weekly uses. Provider selection
+  // mirrors /api/summary exactly: Bedrock primary when BEDROCK_API_KEY is bound,
+  // OpenAI/Anthropic as automatic fallbacks. See server/llmConfig.ts.
   // The deployed origin (e.g. https://podcast-afg.pages.dev) — required to build an
   // absolute, click-from-an-inbox link to the hosted PDF (a cron has no request).
   SITE_URL?: string
@@ -56,16 +51,7 @@ export const onRequest = async (context: { request: Request; env: CronEnv }): Pr
     const force = new URL(request.url).searchParams.get('force') === '1'
     const scheduleStore = env.SUMMARIES ? kvScheduleStore(env.SUMMARIES) : null
     const summaryStore = env.SUMMARIES ? kvSummaryStore(env.SUMMARIES) : undefined
-    const summarizeConfig = {
-      openaiKey: env.OPENAI_API_KEY,
-      anthropicKey: env.ANTHROPIC_API_KEY,
-      model: env.SUMMARY_MODEL || undefined,
-      store: summaryStore,
-      llmProvider: env.LLM_PROVIDER === 'claude' ? ('claude' as const) : ('openai' as const),
-      bedrockKey: env.temp_claude_token,
-      bedrockRegion: env.AWS_BEDROCK_REGION || undefined,
-      bedrockModel: env.AWS_BEDROCK_MODEL_ID || undefined,
-    }
+    const summarizeConfig = { ...llmConfigFromEnv(env), store: summaryStore }
 
     // Auto-process the week, sustainably: on EVERY tick, summarise a bounded batch of
     // this week's pending episodes (writes to the shared store). Over the 30-min ticks

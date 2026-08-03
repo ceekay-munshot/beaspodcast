@@ -5,7 +5,9 @@ import react from '@vitejs/plugin-react'
 import path from 'node:path'
 import { episodesForFeed, getLiveEpisodes, SEED_IDS } from './server/feeds'
 import { searchPodcasts } from './server/search'
-import { summarizeEpisode, synthesizeWeekly } from './server/summarize'
+import { probeLlm, providerChain, summarizeEpisode, synthesizeWeekly } from './server/summarize'
+import { llmConfigFromEnv, llmCredentialsPresent, redactSecrets, type LlmConfig } from './server/llmConfig'
+import { DEFAULT_BEDROCK_REGION } from './server/bedrockClaude'
 import { fileSummaryStore } from './server/summaryStore.node'
 import { handleChannels } from './server/channelStore'
 import { fileChannelStore } from './server/channelStore.node'
@@ -49,10 +51,7 @@ function userOf(req: Connect.IncomingMessage): string | null {
 // Serves the live-feed + summary API during `vite dev` / preview, mirroring the
 // Cloudflare Pages Functions (functions/api/*) used in production. Both call the
 // same shared server/* modules, so local and prod behave identically.
-function liveApiPlugin(config: {
-  openaiKey?: string
-  anthropicKey?: string
-  model?: string
+function liveApiPlugin(config: LlmConfig & {
   deepgramKey?: string
   deepgramModel?: string
   groqKey?: string
@@ -60,10 +59,6 @@ function liveApiPlugin(config: {
   emailToken?: string
   siteUrl?: string
   emailAttachments?: boolean
-  llmProvider?: 'openai' | 'claude'
-  bedrockKey?: string
-  bedrockRegion?: string
-  bedrockModel?: string
 }): Plugin {
   // Shared summary store for dev: a filesystem mirror of the prod KV namespace, so
   // a summary generated once is reused across reloads and across every browser that
@@ -269,9 +264,34 @@ function liveApiPlugin(config: {
         }
       })
 
+      // Mirrors the Pages Function at functions/api/health/llm.ts so `npm run dev`
+      // and production answer the same question the same way.
+      server.middlewares.use('/api/health/llm', async (req, res) => {
+        if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' })
+        const configured = llmCredentialsPresent(config)
+        const region = config.bedrockRegion || DEFAULT_BEDROCK_REGION
+        if (!configured.bedrock && !configured.openai && !configured.anthropic) {
+          return json(res, 503, { ok: false, error: 'no_api_key', detail: 'No LLM credential is set in .env', configured })
+        }
+        try {
+          const probe = await probeLlm(config)
+          json(res, 200, {
+            ok: true,
+            provider: probe.provider,
+            model: probe.model,
+            ...(probe.provider === 'bedrock' ? { region } : {}),
+            chain: probe.chain,
+            configured,
+            ms: probe.ms,
+          })
+        } catch (e) {
+          json(res, 502, { ok: false, error: 'llm_unreachable', detail: redactSecrets(String(e), config).slice(0, 500), chain: [], configured })
+        }
+      })
+
       server.middlewares.use('/api/summary', async (req, res) => {
         if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' })
-        if (!config.openaiKey && !config.anthropicKey && !(config.llmProvider === 'claude' && config.bedrockKey)) return json(res, 503, { error: 'no_api_key' })
+        if (!providerChain(config).length) return json(res, 503, { error: 'no_api_key' })
         try {
           const input = JSON.parse((await readBody(req)) || '{}')
           if (input.mode === 'weekly') {
@@ -294,9 +314,6 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const pick = (k: string) => env[k] || process.env[k] || ''
   const summaryConfig = {
-    openaiKey: pick('OPENAI_API_KEY'),
-    anthropicKey: pick('ANTHROPIC_API_KEY'),
-    model: pick('SUMMARY_MODEL') || undefined,
     deepgramKey: pick('DEEPGRAM_API_KEY'), // transcription for long episodes
     deepgramModel: pick('DEEPGRAM_MODEL') || undefined,
     groqKey: pick('GROQ_API_KEY'), // free-tier Whisper (short episodes)
@@ -304,11 +321,19 @@ export default defineConfig(({ mode }) => {
     emailToken: pick('MUNSHOT_EMAIL_TOKEN') || undefined, // service token for server-side sends
     siteUrl: pick('SITE_URL') || undefined, // absolute origin for hosted-PDF links
     emailAttachments: pick('EMAIL_ATTACHMENTS') === '1', // attach the weekly PDF (endpoint must support it)
-    // Claude/Bedrock toggle (see server/bedrockClaude.ts) — defaults to "openai".
-    llmProvider: (pick('LLM_PROVIDER') === 'claude' ? 'claude' : 'openai') as 'openai' | 'claude',
-    bedrockKey: pick('temp_claude_token') || undefined,
-    bedrockRegion: pick('AWS_BEDROCK_REGION') || undefined,
-    bedrockModel: pick('AWS_BEDROCK_MODEL_ID') || undefined,
+    // LLM provider selection — identical to production (server/llmConfig.ts):
+    // Bedrock is primary when BEDROCK_API_KEY is set, OpenAI/Anthropic fall back
+    // behind it, and LLM_PROVIDER promotes one to the front.
+    ...llmConfigFromEnv({
+      BEDROCK_API_KEY: pick('BEDROCK_API_KEY'),
+      OPENAI_API_KEY: pick('OPENAI_API_KEY'),
+      ANTHROPIC_API_KEY: pick('ANTHROPIC_API_KEY'),
+      SUMMARY_MODEL: pick('SUMMARY_MODEL'),
+      LLM_PROVIDER: pick('LLM_PROVIDER'),
+      AWS_BEDROCK_REGION: pick('AWS_BEDROCK_REGION'),
+      AWS_BEDROCK_MODEL_ID: pick('AWS_BEDROCK_MODEL_ID'),
+      temp_claude_token: pick('temp_claude_token'),
+    }),
   }
 
   return {

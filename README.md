@@ -140,8 +140,47 @@ none, it skips (never an empty email).
 | Pages project (Settings → Variables) | `MUNSHOT_EMAIL_TOKEN` | **Service** token authorizing server-to-server sends (the "god token"). Used by the cron *and* the `/api/email/send` proxy. Store as an **encrypted secret** — never commit it. |
 | Pages project | `CRON_SECRET` | Bearer token guarding `/api/cron/weekly-digest`. |
 | Pages project | `SITE_URL` | Deployed origin, e.g. `https://podcast-afg.pages.dev` — required to build an absolute link to the hosted PDF (a cron has no request). |
-| Pages project | `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`) + optional `SUMMARY_MODEL` | The summariser. Use a strong model (e.g. `claude-opus-4-8`) — the investable-insight + quant extraction quality scales with model strength. |
+| Pages project | `BEDROCK_API_KEY` | The summariser (primary). See **LLM provider** below. |
 | GitHub repo (Settings → Secrets → Actions) | `SITE_URL`, `CRON_SECRET` | Same values as the Pages vars. |
+
+## LLM provider
+
+Summarization runs on **Claude via Amazon Bedrock** by default, with OpenAI as an
+automatic fallback. Providers are ordered by which credential is bound, and tried
+in turn — if the primary fails, the next one runs on the same request.
+
+| Variable | Purpose |
+|----------|---------|
+| `BEDROCK_API_KEY` | Bedrock API key, sent as a bearer token in the `x-api-key` header. **Its presence alone makes Bedrock primary.** Store as an encrypted secret. |
+| `AWS_BEDROCK_REGION` | Bedrock region. Default `us-east-1`. |
+| `AWS_BEDROCK_MODEL_ID` | Pin one model instead of walking the fallback chain. Ids carry the `anthropic.` prefix. |
+| `LLM_PROVIDER` | Force one provider to the front: `bedrock` \| `openai` \| `anthropic`. Set to `openai` to switch back. |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` + `SUMMARY_MODEL` | Fallback providers, unchanged. |
+
+Requests go to `https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages`
+with `anthropic-version: 2023-06-01`. There is **no AWS SDK and no SigV4
+signing**, which is what lets it run on the Workers runtime. The key is read from
+the Worker `env` binding and is only ever used inside the Worker — client-side JS
+calls `/api/summary`, never Bedrock directly.
+
+Bedrock grants model access per AWS account, so the transport walks a chain —
+`anthropic.claude-opus-5` → `anthropic.claude-opus-4-8` →
+`anthropic.claude-sonnet-5` — and pins the first model that answers (a 403 on
+Opus 5 is expected, not an error). It likewise tries native `output_config`
+structured output first and falls back to forced single-tool use, pinning
+whichever the deployment accepts.
+
+**Health check.** `GET /api/health/llm` makes one deliberately tiny structured
+call through the same chain and reports which provider and model answered — a
+ten-second confirmation that a key works, without triggering any real work. It
+returns booleans for which credentials are bound, never the key itself.
+
+```console
+$ curl -s https://<your-site>/api/health/llm
+{ "ok": true, "provider": "bedrock", "model": "anthropic.claude-opus-4-8",
+  "region": "us-east-1", "chain": ["bedrock", "openai"],
+  "configured": { "bedrock": true, "openai": true, "anthropic": false }, "ms": 812 }
+```
 
 Trigger it by hand any time from the Actions tab (**workflow_dispatch**) to test.
 Locally, `vite dev` mirrors every route (`/api/email/send`, `/api/report/:id`,

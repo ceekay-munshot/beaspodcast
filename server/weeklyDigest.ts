@@ -3,8 +3,7 @@ import { PODCASTS } from '../src/lib/mock-data'
 import { assembleWeekly, buildCitations, buildWeeklySources, hashKey, mergeWeeklyAi } from '../src/lib/weeklyAssemble'
 import { weeklyBriefEmailHtml, bytesToBase64, type EmailAttachment } from '../src/lib/email'
 import { weeklyReportFilename, weeklyReportTitle } from '../src/lib/reportName'
-import { summarizeEpisode, synthesizeWeekly, type SummarizeConfig } from './summarize'
-import { isBedrockClaudeSelected } from './bedrockClaude'
+import { providerChain, summarizeEpisode, synthesizeWeekly, type SummarizeConfig } from './summarize'
 import type { SummaryStore } from './summaryStore'
 import type { SubscriberStore } from './subscriberStore'
 
@@ -96,7 +95,7 @@ export function pickPendingThisWeek(episodes: Episode[], now: number): Episode[]
  *  publisher transcript when the feed carries one, else the show-notes — keeping the
  *  Monday run fast and bounded instead of transcribing a dozen full episodes inline. */
 export function makeEpisodeProcessor(cfg: SummarizeConfig | undefined): ((ep: Episode) => Promise<Summary | null>) | undefined {
-  if (!cfg || (!cfg.openaiKey && !cfg.anthropicKey && !isBedrockClaudeSelected(cfg))) return undefined
+  if (!cfg || !providerChain(cfg).length) return undefined
   return async (ep) => {
     const show = PODCASTS.find((p) => p.id === ep.podcastId)?.title ?? ep.podcastId
     const res = await summarizeEpisode(
@@ -226,7 +225,7 @@ export async function runWeeklyDigest(deps: DigestDeps): Promise<{ status: numbe
   // means a browser visit this week and this cron reuse each other's one LLM call.
   let weekly = assembleWeekly(ready, podcastById)
   const cfg = deps.summarizeConfig
-  if (cfg && (cfg.openaiKey || cfg.anthropicKey || isBedrockClaudeSelected(cfg))) {
+  if (cfg && providerChain(cfg).length) {
     const citations = buildCitations(ready, podcastById)
     const sources = buildWeeklySources(ready, citations, podcastById)
     const ai = await synthesizeWeekly({ id: `weekly:${hashKey(ready)}`, range: weekly.rangeLabel, sources }, { ...cfg, store: deps.summaryStore }).catch(() => null)

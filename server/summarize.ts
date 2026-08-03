@@ -2,15 +2,19 @@ import type { EpisodeInsight, EpisodeTone, Highlight, Idea, InsightParty, QAItem
 import { stableHash } from '../src/lib/hash'
 import { transcribeEpisode } from './transcribe'
 import { SUMMARY_REVISION, sharedSummaryKey, type SummaryStore } from './summaryStore'
-import { DEFAULT_BEDROCK_MODEL, isBedrockClaudeSelected, viaBedrockClaude } from './bedrockClaude'
+import { callBedrockClaude, isBedrockConfigured, plannedBedrockModel } from './bedrockClaude'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AI summarization — runtime-agnostic (Vite dev middleware + Cloudflare Pages
 // Function). Builds the app's structured Summary from the best available source:
 // a real transcript (via the transcription provider chain) when one exists, else
-// the publisher's show-notes. Provider-agnostic for the LLM: OpenAI if an OpenAI
-// key is supplied, else Anthropic. Forced tool/function calling guarantees valid
+// the publisher's show-notes. Forced tool/function calling guarantees valid
 // structured JSON. Keys are passed in by the caller (from env) — never hardcoded.
+//
+// LLM PROVIDER SELECTION — see providerChain() below. Providers are ordered by
+// which credential is present, Bedrock (Claude) first, and tried in turn: if the
+// primary fails, the next one runs automatically. Set LLM_PROVIDER to force a
+// specific provider to the front of that order.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface SummarizeInput {
@@ -28,16 +32,23 @@ export interface SummarizeInput {
   force?: boolean
 }
 
+/** The LLM providers this app can talk to, in the order they are preferred when
+ *  more than one credential is configured. */
+export type LlmProvider = 'bedrock' | 'openai' | 'anthropic'
+
 export interface SummarizeConfig {
   openaiKey?: string
   anthropicKey?: string
-  /** Optional model override; otherwise a sensible per-provider default is used. */
+  /** Optional model override for the OpenAI/Anthropic-direct paths; otherwise a
+   *  sensible per-provider default is used. Bedrock uses `bedrockModel`. */
   model?: string
-  /** Provider toggle — defaults to 'openai' so existing deployments are unaffected.
-   *  Set to 'claude' (together with `bedrockKey`) to route through AWS Bedrock
-   *  instead of OpenAI. See bedrockClaude.ts. */
-  llmProvider?: 'openai' | 'claude'
-  /** AWS Bedrock bearer key. Only used when llmProvider === 'claude'. */
+  /** Forces one provider to the FRONT of the chain. Everything else stays as an
+   *  automatic fallback behind it. Unset (the normal case) means "Bedrock first
+   *  when a Bedrock key is present". Accepts the legacy value 'claude' as an
+   *  alias for 'bedrock'. */
+  llmProvider?: LlmProvider
+  /** Bedrock API key (env.BEDROCK_API_KEY). Its presence alone makes Claude via
+   *  Bedrock the primary provider. See bedrockClaude.ts. */
   bedrockKey?: string
   /** Optional Bedrock region/model overrides; otherwise bedrockClaude.ts defaults apply. */
   bedrockRegion?: string
@@ -65,6 +76,84 @@ export interface SummarizeResult {
 
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini'
 const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-4-8'
+
+// ── Provider selection ───────────────────────────────────────────────────────
+// Bedrock is primary whenever a Bedrock key is bound; OpenAI/Anthropic sit behind
+// it as automatic fallbacks. `LLM_PROVIDER` promotes a named provider to the
+// front without removing the others — that is the switch back to OpenAI later.
+
+/** Normalize the raw LLM_PROVIDER env string. 'claude' is accepted as a legacy
+ *  alias for 'bedrock'. Anything unrecognised is ignored (default ordering). */
+export function parseLlmProvider(raw: string | undefined): LlmProvider | undefined {
+  const v = (raw || '').trim().toLowerCase()
+  if (v === 'bedrock' || v === 'claude') return 'bedrock'
+  if (v === 'openai') return 'openai'
+  if (v === 'anthropic') return 'anthropic'
+  return undefined
+}
+
+/** The ordered list of providers to try: [primary, ...fallbacks]. Only providers
+ *  whose credential is actually present are included, so a missing key can never
+ *  produce a doomed attempt. */
+export function providerChain(config: SummarizeConfig): LlmProvider[] {
+  const available: LlmProvider[] = []
+  if (config.bedrockKey) available.push('bedrock')
+  if (config.openaiKey) available.push('openai')
+  if (config.anthropicKey) available.push('anthropic')
+  const forced = config.llmProvider
+  if (forced && available.includes(forced)) return [forced, ...available.filter((p) => p !== forced)]
+  return available
+}
+
+/** The model label a provider will use — for cache keys and the health check. */
+function providerModel(provider: LlmProvider, config: SummarizeConfig): string {
+  if (provider === 'bedrock') return config.bedrockModel || plannedBedrockModel(config.bedrockRegion, config.bedrockModel)
+  if (provider === 'openai') return config.model || DEFAULT_OPENAI_MODEL
+  return config.model || DEFAULT_ANTHROPIC_MODEL
+}
+
+export interface StructuredCallResult {
+  raw: unknown
+  provider: LlmProvider
+  model: string
+}
+
+/**
+ * Run one structured LLM call against the provider chain, falling through to the
+ * next provider on failure. Every provider returns the SAME raw tool-input shape,
+ * so the caller's normalize() is provider-agnostic.
+ *
+ * Throws only when every configured provider has failed; the error names the
+ * primary's failure, which is the one worth acting on.
+ */
+async function runStructured(prompt: { system: string; user: string }, schema: object, config: SummarizeConfig, maxTokens?: number): Promise<StructuredCallResult> {
+  const chain = providerChain(config)
+  if (!chain.length) throw new Error('no_api_key')
+
+  const failures: string[] = []
+  for (const provider of chain) {
+    try {
+      if (provider === 'bedrock') {
+        const out = await callBedrockClaude(prompt, schema, {
+          apiKey: config.bedrockKey as string,
+          region: config.bedrockRegion,
+          model: config.bedrockModel,
+          maxTokens,
+        })
+        return { raw: out.raw, provider, model: out.model }
+      }
+      const model = providerModel(provider, config)
+      const raw = provider === 'openai'
+        ? await viaOpenAI(prompt, config.openaiKey as string, model, schema, maxTokens)
+        : await viaAnthropic(prompt, config.anthropicKey as string, model, schema, maxTokens)
+      return { raw, provider, model }
+    } catch (e) {
+      failures.push(`${provider}: ${String(e).slice(0, 200)}`)
+      // Fall through to the next provider. The last one's failure ends the loop.
+    }
+  }
+  throw new Error(`all_llm_providers_failed — ${failures.join(' | ')}`)
+}
 
 const SCHEMA = {
   type: 'object',
@@ -507,12 +596,12 @@ function buildTranscript(raw: RawSeg[], highlights: Highlight[]): { segments: Tr
 const cache = new Map<string, SummarizeResult>()
 
 export async function summarizeEpisode(input: SummarizeInput, config: SummarizeConfig): Promise<SummarizeResult> {
-  const provider = config.openaiKey ? 'openai' : config.anthropicKey ? 'anthropic' : null
-  const useBedrockClaude = isBedrockClaudeSelected(config)
-  if (!provider && !useBedrockClaude) throw new Error('no_api_key')
-  const model = useBedrockClaude
-    ? config.bedrockModel || DEFAULT_BEDROCK_MODEL
-    : config.model || (provider === 'openai' ? DEFAULT_OPENAI_MODEL : DEFAULT_ANTHROPIC_MODEL)
+  // The chain's HEAD is the provider we expect to answer; it keys the L1 cache
+  // below. A fallback to a later provider still yields a valid summary for this
+  // episode, and the shared L2 store is provider-independent (episode id only).
+  const primary = providerChain(config)[0]
+  if (!primary) throw new Error('no_api_key')
+  const model = providerModel(primary, config)
 
   // Shared, persistent cache (KV in prod, filesystem in dev), keyed by the stable
   // episode id: the FIRST user to open an episode pays the transcription + LLM
@@ -540,16 +629,11 @@ export async function summarizeEpisode(input: SummarizeInput, config: SummarizeC
   // `weekly:<hash>` id (so it's shared like episodes); any truly id-less call falls
   // back to a hash of its show+notes so distinct inputs still get distinct slots.
   const idPart = input.id ?? `n:${stableHash(`${input.show} ${input.notes ?? ''}`)}`
-  const providerTag = useBedrockClaude ? 'bedrock-claude' : provider
-  const cacheKey = `${providerTag}:${model}:${transcript ? 't' : 'n'}:r${SUMMARY_REVISION}::${idPart}`
+  const cacheKey = `${primary}:${model}:${transcript ? 't' : 'n'}:r${SUMMARY_REVISION}::${idPart}`
   const hit = input.force ? undefined : cache.get(cacheKey)
   if (hit) return hit
 
-  const raw = useBedrockClaude
-    ? await viaBedrockClaude(prompt, config.bedrockKey as string, model, SCHEMA, config.bedrockRegion)
-    : provider === 'openai'
-      ? await viaOpenAI(prompt, config.openaiKey as string, model, SCHEMA)
-      : await viaAnthropic(prompt, config.anthropicKey as string, model, SCHEMA)
+  const { raw } = await runStructured(prompt, SCHEMA, config)
   const summary = normalize(raw as RawSummary)
 
   // Bundle the real transcript (the same one the summary was built from) so the
@@ -573,7 +657,7 @@ export async function summarizeEpisode(input: SummarizeInput, config: SummarizeC
 // ── OpenAI (Chat Completions + forced function call) ─────────────────────────
 // Returns the RAW parsed tool-call args (caller normalizes). `schema` lets the
 // same transport drive both the episode summary and the weekly synthesis.
-async function viaOpenAI(prompt: { system: string; user: string }, apiKey: string, model: string, schema: object): Promise<unknown> {
+async function viaOpenAI(prompt: { system: string; user: string }, apiKey: string, model: string, schema: object, maxTokens = 16000): Promise<unknown> {
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
@@ -582,8 +666,8 @@ async function viaOpenAI(prompt: { system: string; user: string }, apiKey: strin
       // 16000 leaves room for the richer schema (synthesis + comprehensive Q&A +
       // the investable insight + quant table + the per-episode investment readouts).
       // Keep it under ~16K: this is a non-streaming raw fetch, and larger outputs
-      // risk HTTP timeouts.
-      max_completion_tokens: 16000,
+      // risk HTTP timeouts. The health probe overrides it down to a few tokens.
+      max_completion_tokens: maxTokens,
       messages: [
         { role: 'system', content: prompt.system },
         { role: 'user', content: prompt.user },
@@ -604,7 +688,7 @@ async function viaOpenAI(prompt: { system: string; user: string }, apiKey: strin
 
 // ── Anthropic (Messages API + forced tool use) ───────────────────────────────
 // Returns the RAW tool-use input (caller normalizes).
-async function viaAnthropic(prompt: { system: string; user: string }, apiKey: string, model: string, schema: object): Promise<unknown> {
+async function viaAnthropic(prompt: { system: string; user: string }, apiKey: string, model: string, schema: object, maxTokens = 16000): Promise<unknown> {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
@@ -612,7 +696,8 @@ async function viaAnthropic(prompt: { system: string; user: string }, apiKey: st
       model,
       // Room for the richer schema (comprehensive Q&A + insight + quant + per-episode
       // investment readouts); <~16K keeps this non-streaming request under HTTP timeouts.
-      max_tokens: 16000,
+      // The health probe overrides it down to a few tokens.
+      max_tokens: maxTokens,
       system: prompt.system,
       tools: [{ name: 'emit_summary', description: 'Emit the structured summary.', input_schema: schema }],
       tool_choice: { type: 'tool', name: 'emit_summary' },
@@ -804,13 +889,8 @@ export interface SynthesizeWeeklyInput {
 /** Run the weekly cross-episode synthesis. Returns the AI narrative, or null when
  *  no LLM key is configured (callers fall back to the deterministic base). */
 export async function synthesizeWeekly(input: SynthesizeWeeklyInput, config: SummarizeConfig): Promise<WeeklyAi | null> {
-  const provider = config.openaiKey ? 'openai' : config.anthropicKey ? 'anthropic' : null
-  const useBedrockClaude = isBedrockClaudeSelected(config)
-  if (!provider && !useBedrockClaude) return null
+  if (!providerChain(config).length) return null
   if (!input.sources.length) return null
-  const model = useBedrockClaude
-    ? config.bedrockModel || DEFAULT_BEDROCK_MODEL
-    : config.model || (provider === 'openai' ? DEFAULT_OPENAI_MODEL : DEFAULT_ANTHROPIC_MODEL)
 
   // Shared-store reuse: the SAME episode-set (same id) is synthesised once total —
   // a browser visit and the Monday cron reuse each other's result.
@@ -821,11 +901,7 @@ export async function synthesizeWeekly(input: SynthesizeWeeklyInput, config: Sum
   }
 
   const prompt = { system: WEEKLY_SYSTEM, user: buildWeeklyUser(input.range, input.sources) }
-  const raw = useBedrockClaude
-    ? await viaBedrockClaude(prompt, config.bedrockKey as string, model, WEEKLY_SCHEMA, config.bedrockRegion)
-    : provider === 'openai'
-      ? await viaOpenAI(prompt, config.openaiKey as string, model, WEEKLY_SCHEMA)
-      : await viaAnthropic(prompt, config.anthropicKey as string, model, WEEKLY_SCHEMA)
+  const { raw } = await runStructured(prompt, WEEKLY_SCHEMA, config)
   const ai = normalizeWeeklyAi(raw)
 
   // Cache under the weekly id (stub `summary` — only `weekly` is read back for this key).
@@ -833,4 +909,44 @@ export async function synthesizeWeekly(input: SynthesizeWeeklyInput, config: Sum
     await config.store.put(sharedKey, { summary: { synthesis: [], highlights: [], qa: [] }, transcript: [], weekly: ai })
   }
   return ai
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HEALTH PROBE — powers GET /api/health/llm. Runs ONE deliberately tiny
+// structured call through the very same provider chain the real work uses, so a
+// green probe means the credential, the endpoint, the model grant AND the
+// structured-output form are all genuinely working. Costs a handful of tokens.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Intentionally minimal, and free of the constraint keywords (minItems/maximum/
+ *  minLength/$ref) that native json_schema mode rejects — so the probe tests the
+ *  transport, never the schema. */
+const PROBE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { status: { type: 'string', description: 'The single word: ok' } },
+  required: ['status'],
+}
+
+export interface LlmProbeResult {
+  provider: LlmProvider
+  model: string
+  /** Which providers have a credential bound, in try order. Names only. */
+  chain: LlmProvider[]
+  ms: number
+}
+
+/** Make one cheap structured call and report which provider and model answered.
+ *  Throws if every configured provider fails; the caller renders the error. */
+export async function probeLlm(config: SummarizeConfig): Promise<LlmProbeResult> {
+  const chain = providerChain(config)
+  if (!chain.length) throw new Error('no_api_key')
+  const started = Date.now()
+  const { provider, model } = await runStructured(
+    { system: 'You are a health check. Reply by calling the tool with status "ok".', user: 'Report status.' },
+    PROBE_SCHEMA,
+    config,
+    64, // tiny ceiling — this must never do real work
+  )
+  return { provider, model, chain, ms: Date.now() - started }
 }
