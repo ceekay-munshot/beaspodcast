@@ -270,8 +270,11 @@ function liveApiPlugin(config: LlmConfig & {
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' })
         const configured = llmCredentialsPresent(config)
         const region = config.bedrockRegion || DEFAULT_BEDROCK_REGION
+        // Booleans only — never the value. Presence answers "did my key reach the app?"
+        const transcription = { deepgram: !!config.deepgramKey, groq: !!config.groqKey }
+        const transcriptsPossible = transcription.deepgram || transcription.groq
         if (!configured.bedrock && !configured.openai && !configured.anthropic) {
-          return json(res, 503, { ok: false, error: 'no_api_key', detail: 'No LLM credential is set in .env', configured })
+          return json(res, 503, { ok: false, error: 'no_api_key', detail: 'No LLM credential is set in .env', configured, transcription, transcriptsPossible })
         }
         try {
           const probe = await probeLlm(config)
@@ -279,13 +282,16 @@ function liveApiPlugin(config: LlmConfig & {
             ok: true,
             provider: probe.provider,
             model: probe.model,
+            ...(probe.structuredMode ? { structuredMode: probe.structuredMode } : {}),
             ...(probe.provider === 'bedrock' ? { region } : {}),
             chain: probe.chain,
             configured,
+            transcription,
+            transcriptsPossible,
             ms: probe.ms,
           })
         } catch (e) {
-          json(res, 502, { ok: false, error: 'llm_unreachable', detail: redactSecrets(String(e), config).slice(0, 500), chain: [], configured })
+          json(res, 502, { ok: false, error: 'llm_unreachable', detail: redactSecrets(String(e), config).slice(0, 500), chain: [], configured, transcription, transcriptsPossible })
         }
       })
 

@@ -2,7 +2,7 @@ import type { EpisodeInsight, EpisodeTone, Highlight, Idea, InsightParty, QAItem
 import { stableHash } from '../src/lib/hash'
 import { transcribeEpisode } from './transcribe'
 import { SUMMARY_REVISION, sharedSummaryKey, type SummaryStore } from './summaryStore'
-import { callBedrockClaude, isBedrockConfigured, plannedBedrockModel } from './bedrockClaude'
+import { callBedrockClaude, isBedrockConfigured, plannedBedrockModel, type StructuredMode } from './bedrockClaude'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AI summarization — runtime-agnostic (Vite dev middleware + Cloudflare Pages
@@ -116,6 +116,8 @@ export interface StructuredCallResult {
   raw: unknown
   provider: LlmProvider
   model: string
+  /** Bedrock only: which structured-output form actually worked. */
+  structuredMode?: StructuredMode
 }
 
 /**
@@ -140,7 +142,7 @@ async function runStructured(prompt: { system: string; user: string }, schema: o
           model: config.bedrockModel,
           maxTokens,
         })
-        return { raw: out.raw, provider, model: out.model }
+        return { raw: out.raw, provider, model: out.model, structuredMode: out.structuredMode }
       }
       const model = providerModel(provider, config)
       const raw = provider === 'openai'
@@ -933,6 +935,8 @@ export interface LlmProbeResult {
   model: string
   /** Which providers have a credential bound, in try order. Names only. */
   chain: LlmProvider[]
+  /** Bedrock only: whether native json_schema or forced tool use is being used. */
+  structuredMode?: StructuredMode
   ms: number
 }
 
@@ -942,11 +946,11 @@ export async function probeLlm(config: SummarizeConfig): Promise<LlmProbeResult>
   const chain = providerChain(config)
   if (!chain.length) throw new Error('no_api_key')
   const started = Date.now()
-  const { provider, model } = await runStructured(
+  const { provider, model, structuredMode } = await runStructured(
     { system: 'You are a health check. Reply by calling the tool with status "ok".', user: 'Report status.' },
     PROBE_SCHEMA,
     config,
     64, // tiny ceiling — this must never do real work
   )
-  return { provider, model, chain, ms: Date.now() - started }
+  return { provider, model, chain, ...(structuredMode ? { structuredMode } : {}), ms: Date.now() - started }
 }
