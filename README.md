@@ -154,6 +154,7 @@ in turn — if the primary fails, the next one runs on the same request.
 | `BEDROCK_API_KEY` | Bedrock API key, sent as a bearer token in the `x-api-key` header. **Its presence alone makes Bedrock primary.** Store as an encrypted secret. |
 | `AWS_BEDROCK_REGION` | Bedrock region. Default `us-east-1`. |
 | `AWS_BEDROCK_MODEL_ID` | Pin one model instead of walking the fallback chain. Ids carry the `anthropic.` prefix. |
+| `BEDROCK_EFFORT` | Thinking depth: `low` (default) \| `medium` \| `high` \| `xhigh` \| `max`. The main latency lever — see below. |
 | `LLM_PROVIDER` | Force one provider to the front: `bedrock` \| `openai` \| `anthropic`. Set to `openai` to switch back. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` + `SUMMARY_MODEL` | Fallback providers, unchanged. |
 
@@ -170,10 +171,29 @@ Opus 5 is expected, not an error). It likewise tries native `output_config`
 structured output first and falls back to forced single-tool use, pinning
 whichever the deployment accepts.
 
+Requests are **streamed** (SSE parsed with `res.body.getReader()`, since the
+async-iterator form of a body is Node-only and throws on Workers) and capped by a
+hard timeout, so a slow generation surfaces as an error rather than a request
+that never returns. `max_tokens` is 32000 because on Opus 5 that budget covers
+thinking *and* the response.
+
+**Effort is the latency lever.** Opus 5 runs adaptive thinking at `high` by
+default, which on a full podcast transcript can think for minutes. `BEDROCK_EFFORT`
+defaults to `low`, which keeps a transcript-grade summary inside the request
+budget. Effort travels inside `output_config`, so on a deployment that rejects
+that field it is dropped automatically along with native structured output.
+
 **Health check.** `GET /api/health/llm` makes one deliberately tiny structured
 call through the same chain and reports which provider and model answered — a
 ten-second confirmation that a key works, without triggering any real work. It
 returns booleans for which credentials are bound, never the key itself.
+
+Two companion routes exist for when a summary silently fails to appear, since the
+pipeline deliberately swallows transcription errors and the Refresh button
+discards its own exception: `GET /api/health/transcribe` validates the Deepgram
+key (add `?url=<audio>&run=1` to perform a real transcription), and
+`GET /api/health/summarize` runs the whole pipeline for one episode and returns
+per-stage timings or the exception.
 
 ```console
 $ curl -s https://<your-site>/api/health/llm

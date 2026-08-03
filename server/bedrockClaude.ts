@@ -60,6 +60,15 @@ const ANTHROPIC_VERSION = '2023-06-01'
 // only because the request is streamed.
 const DEFAULT_MAX_TOKENS = 32000
 
+/** Opus 5's own default is `high`. On a transcript-sized summarization that
+ *  thinks for minutes; `low` is markedly faster and, on this model, still strong.
+ *  Raise via BEDROCK_EFFORT when latency is not the binding constraint. */
+const DEFAULT_EFFORT = 'low'
+
+/** Fail loudly rather than hang. Chosen to land inside the edge's own request
+ *  budget so the caller sees a timeout instead of a dropped connection. */
+const DEFAULT_TIMEOUT_MS = 100_000
+
 export interface BedrockCallOptions {
   /** The Bedrock API key. Read from the Worker `env` binding by the caller —
    *  never from module scope or process.env, neither of which exists on Workers. */
@@ -69,6 +78,15 @@ export interface BedrockCallOptions {
    *  but still falls back if that model is not granted to this account. */
   model?: string
   maxTokens?: number
+  /** Thinking depth: low | medium | high | xhigh | max. Opus 5 defaults to HIGH,
+   *  which on a full transcript thinks long enough to stall the request — this is
+   *  the main latency lever. Rides in `output_config`, so it is dropped
+   *  automatically on deployments that reject that field. */
+  effort?: string
+  /** Hard ceiling on one attempt. Without it a slow generation hangs until the
+   *  connection is dropped, which reads as "the page never loads" rather than an
+   *  error anyone can act on. */
+  timeoutMs?: number
 }
 
 export interface BedrockCallResult {
@@ -88,7 +106,7 @@ export interface BedrockCallResult {
 // FIRST but is never the only candidate — access can be revoked, so the rest of
 // the chain stays available as fallback.
 
-type Pin = { model?: string; structuredMode?: StructuredMode }
+type Pin = { model?: string; structuredMode?: StructuredMode; outputConfigOk?: boolean }
 const pins = new Map<string, Pin>()
 const pinKey = (region: string, modelOverride?: string): string => `${region}|${modelOverride ?? ''}`
 
@@ -128,6 +146,7 @@ function buildBody(
   schema: object,
   mode: StructuredMode,
   maxTokens: number,
+  effort?: string,
 ): Record<string, unknown> {
   const base = {
     model,
@@ -140,13 +159,31 @@ function buildBody(
     // Opus 5 / 4.8 / 4.7 and Sonnet 5 — sending any of them is a hard 400.
   }
   if (mode === 'json_schema') {
-    return { ...base, output_config: { format: { type: 'json_schema', schema } } }
+    return { ...base, output_config: { ...(effort ? { effort } : {}), format: { type: 'json_schema', schema } } }
   }
   return {
     ...base,
+    // `effort` is the only reason a tool-mode request carries output_config at
+    // all; omitted entirely when unsupported or unset.
+    ...(effort ? { output_config: { effort } } : {}),
     tools: [{ name: TOOL_NAME, description: TOOL_DESCRIPTION, input_schema: schema }],
     tool_choice: { type: 'tool', name: TOOL_NAME },
   }
+}
+
+/** One thing to try: a structured-output form, with or without output_config. */
+type Attempt = { mode: StructuredMode; effort?: string }
+
+/** Ordered attempts for a model. A deployment that rejects output_config loses
+ *  BOTH native structured output and the effort knob, so the last attempt always
+ *  carries neither and is guaranteed to be a shape every deployment accepts. */
+function attemptsFor(pin: Pin, effort?: string): Attempt[] {
+  const out: Attempt[] = []
+  const outputConfigUsable = pin.outputConfigOk !== false
+  if (pin.structuredMode !== 'tool' && outputConfigUsable) out.push({ mode: 'json_schema', effort })
+  if (outputConfigUsable && effort) out.push({ mode: 'tool', effort })
+  out.push({ mode: 'tool' })
+  return out
 }
 
 /**
@@ -245,51 +282,89 @@ export async function callBedrockClaude(
   const region = opts.region || DEFAULT_BEDROCK_REGION
   const url = `https://bedrock-mantle.${region}.api.aws/anthropic/v1/messages`
   const maxTokens = opts.maxTokens ?? DEFAULT_MAX_TOKENS
+  const effort = opts.effort ?? DEFAULT_EFFORT
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const key = pinKey(region, opts.model)
-  const pin = pins.get(key) ?? {}
 
   // An explicit model override still gets the access-fallback chain behind it,
   // so a mis-set AWS_BEDROCK_MODEL_ID degrades instead of hard-failing.
   const models = opts.model
     ? [opts.model, ...BEDROCK_MODEL_CHAIN.filter((m) => m !== opts.model)]
-    : preferPinned(pin.model, BEDROCK_MODEL_CHAIN)
-  const modes = preferPinned(pin.structuredMode, STRUCTURED_MODES)
+    : preferPinned(pins.get(key)?.model, BEDROCK_MODEL_CHAIN)
 
   let lastError: Error | null = null
 
   for (const model of models) {
-    for (const mode of modes) {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          // Bearer token goes in x-api-key, NOT Authorization.
-          'x-api-key': opts.apiKey,
-          'anthropic-version': ANTHROPIC_VERSION,
-        },
-        body: JSON.stringify(buildBody(prompt, model, schema, mode, maxTokens)),
-      })
+    // Re-read the pin each round: an earlier attempt may have just learned that
+    // this deployment rejects output_config.
+    for (const attempt of attemptsFor(pins.get(key) ?? {}, effort)) {
+      // The plan above was made before this round; an earlier attempt may have
+      // just proven output_config unusable, so re-check before spending a call.
+      if (pins.get(key)?.outputConfigOk === false && (attempt.effort || attempt.mode === 'json_schema')) continue
 
-      if (res.ok) {
-        const raw = await readStructuredStream(res, mode)
-        pins.set(key, { model, structuredMode: mode })
-        return { raw, model, structuredMode: mode, region }
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      let res: Response
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            // Bearer token goes in x-api-key, NOT Authorization.
+            'x-api-key': opts.apiKey,
+            'anthropic-version': ANTHROPIC_VERSION,
+          },
+          body: JSON.stringify(buildBody(prompt, model, schema, attempt.mode, maxTokens, attempt.effort)),
+          signal: controller.signal,
+        })
+      } catch (e) {
+        clearTimeout(timer)
+        // An abort here is the timeout firing. Name it, so a slow model reads as
+        // a timeout rather than a mystery network error.
+        const aborted = (e as { name?: string })?.name === 'AbortError'
+        throw new Error(
+          aborted
+            ? `bedrock: timed out after ${Math.round(timeoutMs / 1000)}s (${model}/${attempt.mode}) — lower BEDROCK_EFFORT or use a faster model`
+            : `bedrock: request failed (${model}/${attempt.mode}): ${String(e).slice(0, 200)}`,
+        )
       }
 
-      const body = await res.text().catch(() => '')
-      const detail = `bedrock ${res.status} (${model}/${mode}): ${body.slice(0, 200)}`
+      if (res.ok) {
+        try {
+          const raw = await readStructuredStream(res, attempt.mode)
+          pins.set(key, {
+            // Merge, don't replace: a preceding attempt may have already proven
+            // output_config unusable, and that verdict must survive the success.
+            ...(pins.get(key) ?? {}),
+            model,
+            structuredMode: attempt.mode,
+            // Only a successful output_config request proves the field is usable.
+            ...(attempt.effort ? { outputConfigOk: true } : {}),
+          })
+          return { raw, model, structuredMode: attempt.mode, region }
+        } finally {
+          clearTimeout(timer)
+        }
+      }
 
-      // This deployment does not accept output_config — retry the same model with
-      // forced tool use.
+      clearTimeout(timer)
+      const body = await res.text().catch(() => '')
+      const detail = `bedrock ${res.status} (${model}/${attempt.mode}${attempt.effort ? '+effort' : ''}): ${body.slice(0, 200)}`
+
+      // This deployment does not accept output_config, which costs BOTH native
+      // structured output and the effort knob. Record it so attemptsFor drops
+      // every output_config-bearing shape from here on, then fall to the next.
       if (isOutputConfigRejected(res.status, body)) {
         lastError = new Error(detail)
+        pins.set(key, { ...(pins.get(key) ?? {}), outputConfigOk: false })
         continue
       }
       // This account has no access to this model — move to the next one. A pinned
       // model that starts failing this way is dropped so discovery re-runs.
       if (isModelAccessError(res.status)) {
         lastError = new Error(detail)
-        if (pin.model === model) pins.set(key, { ...pin, model: undefined })
+        const cur = pins.get(key) ?? {}
+        if (cur.model === model) pins.set(key, { ...cur, model: undefined })
         break
       }
       // Anything else (429, 5xx, malformed request) is a real failure: throw so

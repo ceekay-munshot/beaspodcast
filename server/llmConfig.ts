@@ -28,6 +28,10 @@ export interface LlmEnv {
   AWS_BEDROCK_REGION?: string
   /** Pins one Bedrock model instead of walking the built-in fallback chain. */
   AWS_BEDROCK_MODEL_ID?: string
+  /** Thinking depth: low | medium | high | xhigh | max. Defaults to `low`, which
+   *  is what keeps a transcript-sized summary inside the request budget. Raise it
+   *  for more thorough summaries at the cost of latency. */
+  BEDROCK_EFFORT?: string
   /** Legacy name the Bedrock key was first deployed under — still honoured so an
    *  existing deployment keeps working after this rename. Prefer BEDROCK_API_KEY. */
   temp_claude_token?: string
@@ -35,7 +39,7 @@ export interface LlmEnv {
 
 export type LlmConfig = Pick<
   SummarizeConfig,
-  'openaiKey' | 'anthropicKey' | 'model' | 'llmProvider' | 'bedrockKey' | 'bedrockRegion' | 'bedrockModel'
+  'openaiKey' | 'anthropicKey' | 'model' | 'llmProvider' | 'bedrockKey' | 'bedrockRegion' | 'bedrockModel' | 'bedrockEffort'
 >
 
 export function llmConfigFromEnv(env: LlmEnv | undefined): LlmConfig {
@@ -48,6 +52,7 @@ export function llmConfigFromEnv(env: LlmEnv | undefined): LlmConfig {
     bedrockKey: e.BEDROCK_API_KEY || e.temp_claude_token || undefined,
     bedrockRegion: e.AWS_BEDROCK_REGION || undefined,
     bedrockModel: e.AWS_BEDROCK_MODEL_ID || undefined,
+    bedrockEffort: e.BEDROCK_EFFORT || undefined,
   }
 }
 

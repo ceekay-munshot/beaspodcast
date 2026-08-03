@@ -281,6 +281,47 @@ describe('callBedrockClaude — structured output fallback', () => {
   })
 })
 
+describe('callBedrockClaude — effort and timeout', () => {
+  it('asks for low effort by default — Opus 5 would otherwise think at high', async () => {
+    fetchMock.mockResolvedValueOnce(jsonSchemaOk())
+    await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'us-gov-west-1' })
+    expect(bodyOf(0).output_config.effort).toBe('low')
+  })
+
+  it('honours an explicit effort override', async () => {
+    fetchMock.mockResolvedValueOnce(jsonSchemaOk())
+    await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-east-1', effort: 'high' })
+    expect(bodyOf(0).output_config.effort).toBe('high')
+  })
+
+  it('drops effort entirely once the deployment rejects output_config', async () => {
+    // json_schema+effort rejected → the effort-bearing tool attempt is skipped
+    // rather than wasted → the plain tool call carries no output_config at all.
+    fetchMock.mockResolvedValueOnce(OUTPUT_CONFIG_REJECTED).mockResolvedValueOnce(toolOk())
+    const out = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'eu-central-2' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(bodyOf(1)).not.toHaveProperty('output_config')
+    expect(out.raw).toEqual(PAYLOAD)
+  })
+
+  it('reports a stalled generation as a timeout instead of hanging forever', async () => {
+    // A request that never settles is exactly what made the page spin: without a
+    // ceiling there is no error to show, only a dead connection.
+    fetchMock.mockImplementationOnce((_url: string, init: { signal: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => {
+          const e = new Error('aborted')
+          e.name = 'AbortError'
+          reject(e)
+        })
+      }),
+    )
+    await expect(
+      callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-south-2', timeoutMs: 20 }),
+    ).rejects.toThrow(/timed out after/)
+  })
+})
+
 describe('providerChain — Bedrock primary, OpenAI automatic fallback', () => {
   it('puts Bedrock first whenever a Bedrock key is bound', () => {
     expect(providerChain({ bedrockKey: 'b', openaiKey: 'o' })).toEqual(['bedrock', 'openai'])
