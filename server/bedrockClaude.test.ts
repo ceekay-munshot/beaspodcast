@@ -15,21 +15,51 @@ const SCHEMA = { type: 'object', additionalProperties: false, properties: { stat
 const PROMPT = { system: 'sys', user: 'usr' }
 const PAYLOAD = { status: 'ok' }
 
-/** A successful forced-tool-use Bedrock response. */
-const toolOk = () => ({
-  ok: true,
-  status: 200,
-  json: async () => ({ stop_reason: 'tool_use', content: [{ type: 'tool_use', name: 'emit_summary', input: PAYLOAD }] }),
-  text: async () => '',
-})
+/** Build a mock streamed Response: SSE frames handed out as byte chunks via
+ *  getReader(), exactly as the Workers runtime delivers them. */
+function sseResponse(frames: string[], chunkSplitter?: (all: string) => string[]) {
+  const all = frames.join('')
+  const chunks = chunkSplitter ? chunkSplitter(all) : [all]
+  const encoder = new TextEncoder()
+  let i = 0
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () =>
+          i < chunks.length ? { done: false, value: encoder.encode(chunks[i++]) } : { done: true, value: undefined },
+      }),
+    },
+    text: async () => '',
+  }
+}
 
-/** A successful native structured-output (json_schema) Bedrock response. */
-const jsonSchemaOk = () => ({
-  ok: true,
-  status: 200,
-  json: async () => ({ stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(PAYLOAD) }] }),
-  text: async () => '',
-})
+const frame = (obj: unknown) => `data: ${JSON.stringify(obj)}\n\n`
+
+/** Forced-tool-use stream: the payload arrives as input_json_delta fragments. */
+const toolFrames = (payload: unknown = PAYLOAD) => {
+  const json = JSON.stringify(payload)
+  const mid = Math.ceil(json.length / 2)
+  return [
+    frame({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'emit_summary' } }),
+    frame({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: json.slice(0, mid) } }),
+    frame({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: json.slice(mid) } }),
+    frame({ type: 'content_block_stop' }),
+    frame({ type: 'message_delta', delta: { stop_reason: 'tool_use' } }),
+  ]
+}
+
+/** Native structured-output stream: the payload arrives as text_delta fragments. */
+const jsonSchemaFrames = (payload: unknown = PAYLOAD) => [
+  frame({ type: 'content_block_start', content_block: { type: 'text' } }),
+  frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: JSON.stringify(payload) } }),
+  frame({ type: 'content_block_stop' }),
+  frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }),
+]
+
+const toolOk = () => sseResponse(toolFrames())
+const jsonSchemaOk = () => sseResponse(jsonSchemaFrames())
 
 const err = (status: number, body: string) => ({ ok: false, status, json: async () => ({}), text: async () => body })
 
@@ -78,6 +108,99 @@ describe('callBedrockClaude — endpoint and auth', () => {
 
   it('uses anthropic.-prefixed model ids', () => {
     for (const model of BEDROCK_MODEL_CHAIN) expect(model.startsWith('anthropic.')).toBe(true)
+  })
+})
+
+describe('callBedrockClaude — streaming (Workers runtime)', () => {
+  // A fresh region has no pin, so json_schema is attempted first. Tool-mode tests
+  // therefore prime the deployment's output_config rejection, making the SECOND
+  // fetch the forced-tool-use call under test (hence bodyOf(1)).
+  const primeToolMode = (streamed: unknown) => {
+    fetchMock.mockResolvedValueOnce(OUTPUT_CONFIG_REJECTED).mockResolvedValueOnce(streamed)
+  }
+
+  it('streams the request so a long thinking+output run cannot stall the connection', async () => {
+    fetchMock.mockResolvedValueOnce(jsonSchemaOk())
+    await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'us-east-2' })
+    expect(bodyOf(0).stream).toBe(true)
+  })
+
+  it('reads the body via getReader(), never the Node-only async iterator', async () => {
+    let usedGetReader = false
+    const res = jsonSchemaOk()
+    const realGetReader = res.body.getReader
+    res.body.getReader = () => {
+      usedGetReader = true
+      return realGetReader()
+    }
+    // A Workers ReadableStream has no Symbol.asyncIterator — if the code reached
+    // for one, this would throw rather than silently pass.
+    Object.defineProperty(res.body, Symbol.asyncIterator, {
+      get() {
+        throw new Error('async iteration is Node-only and throws on Workers')
+      },
+    })
+    fetchMock.mockResolvedValueOnce(res)
+    const out = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'us-west-1' })
+    expect(usedGetReader).toBe(true)
+    expect(out.raw).toEqual(PAYLOAD)
+  })
+
+  it('reassembles SSE frames that split mid-line across chunk boundaries', async () => {
+    // Chop the stream into 7-byte chunks so nearly every frame — and the JSON
+    // inside it — is torn across reads.
+    primeToolMode(sseResponse(toolFrames(), (all) => all.match(/[\s\S]{1,7}/g) ?? [all]))
+    const out = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-southeast-1' })
+    expect(out.raw).toEqual(PAYLOAD)
+  })
+
+  it('concatenates input_json_delta fragments (tool payloads are not text_delta)', async () => {
+    const big = { status: 'ok', note: 'x'.repeat(300) }
+    primeToolMode(sseResponse(toolFrames(big), (all) => all.match(/[\s\S]{1,13}/g) ?? [all]))
+    const out = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-northeast-3' })
+    expect(out.raw).toEqual(big)
+  })
+
+  it('ignores deltas from a content block that is not the forced tool', async () => {
+    primeToolMode(
+      sseResponse([
+        frame({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'some_other_tool' } }),
+        frame({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{"junk":1}' } }),
+        frame({ type: 'content_block_stop' }),
+        ...toolFrames(),
+      ]),
+    )
+    const out = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'eu-west-2' })
+    expect(out.raw).toEqual(PAYLOAD)
+  })
+
+  it('reports a truncated response instead of a confusing JSON parse error', async () => {
+    primeToolMode(
+      sseResponse([
+        frame({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'emit_summary' } }),
+        frame({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{"status":' } }),
+        frame({ type: 'message_delta', delta: { stop_reason: 'max_tokens' } }),
+      ]),
+    )
+    await expect(callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'eu-south-1' })).rejects.toThrow(/max_tokens/)
+  })
+
+  it('surfaces an error frame delivered mid-stream', async () => {
+    primeToolMode(
+      sseResponse([
+        frame({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'emit_summary' } }),
+        frame({ type: 'error', error: { message: 'upstream exploded' } }),
+      ]),
+    )
+    await expect(callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ca-west-1' })).rejects.toThrow(/upstream exploded/)
+  })
+
+  it('leaves room for thinking plus a transcript-grade summary', async () => {
+    fetchMock.mockResolvedValueOnce(jsonSchemaOk())
+    await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'me-south-1' })
+    // Opus 5 spends this budget on thinking AND the answer — 16000 truncated once
+    // a real transcript was in play.
+    expect(bodyOf(0).max_tokens).toBeGreaterThanOrEqual(32000)
   })
 })
 
@@ -153,7 +276,7 @@ describe('callBedrockClaude — structured output fallback', () => {
   })
 
   it('reports a refusal rather than failing to parse empty content', async () => {
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ stop_reason: 'refusal', content: [] }), text: async () => '' })
+    fetchMock.mockResolvedValueOnce(sseResponse([frame({ type: 'message_delta', delta: { stop_reason: 'refusal' } })]))
     await expect(callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'il-central-1' })).rejects.toThrow(/refusal/)
   })
 })

@@ -16,13 +16,17 @@
 //
 // Docs: https://platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock
 //
-// NOTE: this is deliberately a non-streaming request. max_tokens is 16000, well
-// under the threshold where a non-streaming call risks an HTTP timeout, and the
-// callers need the whole structured object before they can do anything with it.
-// If this ever becomes streaming, parse the SSE with `res.body.getReader()` and
-// buffer across chunks — `for await (const chunk of res.body)` is Node-only and
-// throws on Workers, and SSE frames split mid-line. Tool payloads also stream as
-// `input_json_delta`, not `text_delta`.
+// STREAMING. Requests are streamed and the SSE is parsed with
+// `res.body.getReader()` — `for await (const chunk of res.body)` is Node-only and
+// throws on the Workers runtime. Frames split mid-line across chunks, so the
+// reader buffers and only consumes complete lines. Tool payloads arrive as
+// `input_json_delta` (NOT `text_delta`) and are concatenated into the tool input.
+//
+// Streaming is not optional here. Claude Opus 5 has thinking ON by default, and
+// `max_tokens` bounds thinking PLUS the response, so a large structured summary
+// over a full podcast transcript runs long enough that a non-streaming request
+// stalls until the connection is dropped — which surfaces to the user as a
+// request that hangs forever rather than as an error.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Region is a Worker variable (AWS_BEDROCK_REGION); this is the fallback. */
@@ -49,7 +53,12 @@ const STRUCTURED_MODES: readonly StructuredMode[] = ['json_schema', 'tool']
 const TOOL_NAME = 'emit_summary'
 const TOOL_DESCRIPTION = 'Emit the structured summary.'
 const ANTHROPIC_VERSION = '2023-06-01'
-const DEFAULT_MAX_TOKENS = 16000
+
+// Room for adaptive thinking AND a full transcript-grade summary. On Opus 5 the
+// two share this budget, so the old 16000 (sized for a non-thinking model writing
+// the answer alone) truncates once a real transcript is in play. Safe to raise
+// only because the request is streamed.
+const DEFAULT_MAX_TOKENS = 32000
 
 export interface BedrockCallOptions {
   /** The Bedrock API key. Read from the Worker `env` binding by the caller —
@@ -113,18 +122,6 @@ function isOutputConfigRejected(status: number, body: string): boolean {
 
 // ── Request / response ───────────────────────────────────────────────────────
 
-interface BedrockContentBlock {
-  type: string
-  text?: string
-  name?: string
-  input?: unknown
-}
-interface BedrockMessageResponse {
-  content?: BedrockContentBlock[]
-  stop_reason?: string
-  model?: string
-}
-
 function buildBody(
   prompt: { system: string; user: string },
   model: string,
@@ -137,6 +134,8 @@ function buildBody(
     max_tokens: maxTokens,
     system: prompt.system,
     messages: [{ role: 'user', content: prompt.user }],
+    // Streamed so a long thinking+output run can't stall the connection.
+    stream: true,
     // NO `temperature` / `top_p` / `top_k`. Sampling parameters were removed on
     // Opus 5 / 4.8 / 4.7 and Sonnet 5 — sending any of them is a hard 400.
   }
@@ -150,31 +149,86 @@ function buildBody(
   }
 }
 
-function extractStructured(data: BedrockMessageResponse, mode: StructuredMode): unknown {
-  // Check the stop reason first: a refusal or a truncated response yields content
-  // that fails to parse in confusing ways. Naming the real cause lets the caller's
-  // provider fallback log something actionable.
-  if (data.stop_reason === 'refusal') throw new Error('bedrock: request was declined by safety classifiers (stop_reason=refusal)')
-  if (data.stop_reason === 'max_tokens') throw new Error('bedrock: response hit max_tokens before the structured output was complete')
+/**
+ * Read a streamed Messages-API response and return the structured payload.
+ *
+ * Uses `res.body.getReader()` — the async-iterator form of a response body is a
+ * Node-only extension and throws on Workers. Chunk boundaries do not respect SSE
+ * frame boundaries, so `buffer` holds the trailing partial line until the rest of
+ * it arrives.
+ */
+async function readStructuredStream(res: Response, mode: StructuredMode): Promise<unknown> {
+  const reader = res.body?.getReader()
+  if (!reader) throw new Error('bedrock: streamed response had no readable body')
 
-  const content = data.content ?? []
-  if (mode === 'tool') {
-    const toolUse = content.find((b) => b.type === 'tool_use' && b.name === TOOL_NAME)
-    if (!toolUse || toolUse.input === undefined) throw new Error(`bedrock: no ${TOOL_NAME} tool_use in response`)
-    return toolUse.input
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let toolJson = '' // concatenated input_json_delta fragments (tool mode)
+  let text = '' // concatenated text_delta fragments (json_schema mode)
+  let stopReason: string | null = null
+  let inTargetTool = false
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    // Consume only COMPLETE lines; whatever trails stays buffered for the next chunk.
+    let nl: number
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).trim()
+      buffer = buffer.slice(nl + 1)
+      if (!line.startsWith('data:')) continue // skip `event:` lines and keep-alives
+      const payload = line.slice(5).trim()
+      if (!payload || payload === '[DONE]') continue
+
+      let ev: {
+        type?: string
+        content_block?: { type?: string; name?: string }
+        delta?: { type?: string; partial_json?: string; text?: string; stop_reason?: string }
+        error?: { message?: string }
+      }
+      try {
+        ev = JSON.parse(payload)
+      } catch {
+        continue // a malformed frame is not worth failing the whole response over
+      }
+
+      switch (ev.type) {
+        case 'content_block_start':
+          // Only accumulate the forced tool's input — never another block's.
+          inTargetTool = ev.content_block?.type === 'tool_use' && ev.content_block?.name === TOOL_NAME
+          break
+        case 'content_block_delta':
+          if (ev.delta?.type === 'input_json_delta' && inTargetTool) toolJson += ev.delta.partial_json ?? ''
+          else if (ev.delta?.type === 'text_delta') text += ev.delta.text ?? ''
+          break
+        case 'content_block_stop':
+          inTargetTool = false
+          break
+        case 'message_delta':
+          if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason
+          break
+        case 'error':
+          throw new Error(`bedrock stream error: ${ev.error?.message ?? 'unknown'}`)
+      }
+    }
   }
-  const text = content
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text ?? '')
-    .join('')
-    .trim()
-  if (!text) throw new Error('bedrock: empty json_schema response')
+
+  if (stopReason === 'refusal') throw new Error('bedrock: request was declined by safety classifiers (stop_reason=refusal)')
+  if (stopReason === 'max_tokens') {
+    throw new Error('bedrock: hit max_tokens before the structured output was complete — raise max_tokens or lower effort')
+  }
+
+  const raw = mode === 'tool' ? toolJson : text
+  if (!raw.trim()) throw new Error(`bedrock: streamed response carried no ${mode === 'tool' ? TOOL_NAME + ' tool input' : 'json_schema text'}`)
   try {
-    return JSON.parse(text)
+    return JSON.parse(raw)
   } catch {
-    throw new Error('bedrock: json_schema response was not valid JSON')
+    throw new Error(`bedrock: streamed ${mode} payload was not valid JSON`)
   }
 }
+
 
 /**
  * Call Claude on Bedrock and return the raw structured object.
@@ -217,8 +271,7 @@ export async function callBedrockClaude(
       })
 
       if (res.ok) {
-        const data = (await res.json()) as BedrockMessageResponse
-        const raw = extractStructured(data, mode)
+        const raw = await readStructuredStream(res, mode)
         pins.set(key, { model, structuredMode: mode })
         return { raw, model, structuredMode: mode, region }
       }
