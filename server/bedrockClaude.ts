@@ -65,6 +65,19 @@ const DEFAULT_MAX_TOKENS = 32000
  *  Raise via BEDROCK_EFFORT when latency is not the binding constraint. */
 const DEFAULT_EFFORT = 'low'
 
+/** Thinking mode. `effort` can only be requested inside `output_config`, which
+ *  some deployments reject outright — on those, Opus 5 silently runs at its
+ *  DEFAULT effort of `high` and thinks for minutes on a transcript-sized task,
+ *  blowing both the time budget and max_tokens. `thinking` is a TOP-LEVEL
+ *  parameter, so disabling it is the one latency lever that always lands.
+ *
+ *  Disabled thinking is accepted on Opus 5 at effort `high` or below (the
+ *  default), and suits this workload: extracting a fixed schema from a
+ *  transcript is not a reasoning task — the OpenAI path this replaced used a
+ *  non-thinking model throughout. Set BEDROCK_THINKING=adaptive to turn it back
+ *  on where latency is not the binding constraint. */
+const DEFAULT_THINKING = 'disabled'
+
 /** Fail loudly rather than hang. Chosen to land inside the edge's own request
  *  budget so the caller sees a timeout instead of a dropped connection. */
 const DEFAULT_TIMEOUT_MS = 100_000
@@ -83,6 +96,8 @@ export interface BedrockCallOptions {
    *  the main latency lever. Rides in `output_config`, so it is dropped
    *  automatically on deployments that reject that field. */
   effort?: string
+  /** 'disabled' (default) or 'adaptive'. See DEFAULT_THINKING. */
+  thinking?: string
   /** Hard ceiling on one attempt. Without it a slow generation hangs until the
    *  connection is dropped, which reads as "the page never loads" rather than an
    *  error anyone can act on. */
@@ -147,6 +162,7 @@ function buildBody(
   mode: StructuredMode,
   maxTokens: number,
   effort?: string,
+  thinking?: string,
 ): Record<string, unknown> {
   const base = {
     model,
@@ -155,6 +171,9 @@ function buildBody(
     messages: [{ role: 'user', content: prompt.user }],
     // Streamed so a long thinking+output run can't stall the connection.
     stream: true,
+    // Top-level, so this lands even when output_config (and thus `effort`) is
+    // rejected — the only latency lever that works on every deployment.
+    ...(thinking === 'adaptive' ? { thinking: { type: 'adaptive' } } : { thinking: { type: 'disabled' } }),
     // NO `temperature` / `top_p` / `top_k`. Sampling parameters were removed on
     // Opus 5 / 4.8 / 4.7 and Sonnet 5 — sending any of them is a hard 400.
   }
@@ -257,12 +276,29 @@ async function readStructuredStream(res: Response, mode: StructuredMode): Promis
     throw new Error('bedrock: hit max_tokens before the structured output was complete — raise max_tokens or lower effort')
   }
 
-  const raw = mode === 'tool' ? toolJson : text
+  // With thinking disabled, Opus 5 occasionally writes the tool call into its
+  // visible text instead of emitting a tool_use block. The turn completes
+  // normally and the call never runs, so recover the payload from the text
+  // rather than failing a request the model actually answered.
+  let raw = mode === 'tool' ? toolJson : text
+  let recoveredFromText = false
+  if (mode === 'tool' && !raw.trim() && text.trim()) {
+    raw = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, '')
+    recoveredFromText = true
+  }
+
   if (!raw.trim()) throw new Error(`bedrock: streamed response carried no ${mode === 'tool' ? TOOL_NAME + ' tool input' : 'json_schema text'}`)
   try {
     return JSON.parse(raw)
   } catch {
-    throw new Error(`bedrock: streamed ${mode} payload was not valid JSON`)
+    // A payload that starts as valid JSON but does not close is a truncation,
+    // which is a budget problem, not a malformed-response problem — say which.
+    const looksTruncated = raw.trimStart().startsWith('{') && !raw.trimEnd().endsWith('}')
+    throw new Error(
+      looksTruncated
+        ? `bedrock: ${mode} payload was cut off after ${raw.length} chars — raise max_tokens, lower effort, or disable thinking`
+        : `bedrock: streamed ${mode} payload was not valid JSON${recoveredFromText ? ' (recovered from text, not a tool_use block)' : ''}`,
+    )
   }
 }
 
@@ -283,6 +319,7 @@ export async function callBedrockClaude(
   const url = `https://bedrock-mantle.${region}.api.aws/anthropic/v1/messages`
   const maxTokens = opts.maxTokens ?? DEFAULT_MAX_TOKENS
   const effort = opts.effort ?? DEFAULT_EFFORT
+  const thinking = opts.thinking ?? DEFAULT_THINKING
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const key = pinKey(region, opts.model)
 
@@ -314,7 +351,7 @@ export async function callBedrockClaude(
             'x-api-key': opts.apiKey,
             'anthropic-version': ANTHROPIC_VERSION,
           },
-          body: JSON.stringify(buildBody(prompt, model, schema, attempt.mode, maxTokens, attempt.effort)),
+          body: JSON.stringify(buildBody(prompt, model, schema, attempt.mode, maxTokens, attempt.effort, thinking)),
           signal: controller.signal,
         })
       } catch (e) {

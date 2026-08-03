@@ -56,6 +56,8 @@ export interface SummarizeConfig {
   /** Thinking depth (low|medium|high|xhigh|max). The primary latency lever — see
    *  bedrockClaude.ts. Unset uses that module's default. */
   bedrockEffort?: string
+  /** 'disabled' (default) or 'adaptive' — see bedrockClaude.ts. */
+  bedrockThinking?: string
   // Transcription providers (threaded to the transcribe chain):
   deepgramKey?: string // URL-based, handles long episodes
   deepgramModel?: string
@@ -144,6 +146,7 @@ async function runStructured(prompt: { system: string; user: string }, schema: o
           region: config.bedrockRegion,
           model: config.bedrockModel,
           effort: config.bedrockEffort,
+          thinking: config.bedrockThinking,
           maxTokens,
         })
         return { raw: out.raw, provider, model: out.model, structuredMode: out.structuredMode }

@@ -32,6 +32,10 @@ export interface LlmEnv {
    *  is what keeps a transcript-sized summary inside the request budget. Raise it
    *  for more thorough summaries at the cost of latency. */
   BEDROCK_EFFORT?: string
+  /** 'disabled' (default) or 'adaptive'. Disabled is what keeps a transcript-sized
+   *  summary inside the request budget on deployments that reject output_config
+   *  (and therefore ignore BEDROCK_EFFORT). */
+  BEDROCK_THINKING?: string
   /** Legacy name the Bedrock key was first deployed under — still honoured so an
    *  existing deployment keeps working after this rename. Prefer BEDROCK_API_KEY. */
   temp_claude_token?: string
@@ -39,7 +43,7 @@ export interface LlmEnv {
 
 export type LlmConfig = Pick<
   SummarizeConfig,
-  'openaiKey' | 'anthropicKey' | 'model' | 'llmProvider' | 'bedrockKey' | 'bedrockRegion' | 'bedrockModel' | 'bedrockEffort'
+  'openaiKey' | 'anthropicKey' | 'model' | 'llmProvider' | 'bedrockKey' | 'bedrockRegion' | 'bedrockModel' | 'bedrockEffort' | 'bedrockThinking'
 >
 
 export function llmConfigFromEnv(env: LlmEnv | undefined): LlmConfig {
@@ -53,6 +57,7 @@ export function llmConfigFromEnv(env: LlmEnv | undefined): LlmConfig {
     bedrockRegion: e.AWS_BEDROCK_REGION || undefined,
     bedrockModel: e.AWS_BEDROCK_MODEL_ID || undefined,
     bedrockEffort: e.BEDROCK_EFFORT || undefined,
+    bedrockThinking: e.BEDROCK_THINKING || undefined,
   }
 }
 

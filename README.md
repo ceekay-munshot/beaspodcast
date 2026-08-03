@@ -154,7 +154,8 @@ in turn — if the primary fails, the next one runs on the same request.
 | `BEDROCK_API_KEY` | Bedrock API key, sent as a bearer token in the `x-api-key` header. **Its presence alone makes Bedrock primary.** Store as an encrypted secret. |
 | `AWS_BEDROCK_REGION` | Bedrock region. Default `us-east-1`. |
 | `AWS_BEDROCK_MODEL_ID` | Pin one model instead of walking the fallback chain. Ids carry the `anthropic.` prefix. |
-| `BEDROCK_EFFORT` | Thinking depth: `low` (default) \| `medium` \| `high` \| `xhigh` \| `max`. The main latency lever — see below. |
+| `BEDROCK_EFFORT` | Thinking depth: `low` (default) \| `medium` \| `high` \| `xhigh` \| `max`. Only applies where `output_config` is accepted. |
+| `BEDROCK_THINKING` | `disabled` (default) \| `adaptive`. Top-level, so it always applies — the reliable latency lever. |
 | `LLM_PROVIDER` | Force one provider to the front: `bedrock` \| `openai` \| `anthropic`. Set to `openai` to switch back. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` + `SUMMARY_MODEL` | Fallback providers, unchanged. |
 
@@ -177,11 +178,19 @@ hard timeout, so a slow generation surfaces as an error rather than a request
 that never returns. `max_tokens` is 32000 because on Opus 5 that budget covers
 thinking *and* the response.
 
-**Effort is the latency lever.** Opus 5 runs adaptive thinking at `high` by
-default, which on a full podcast transcript can think for minutes. `BEDROCK_EFFORT`
-defaults to `low`, which keeps a transcript-grade summary inside the request
-budget. Effort travels inside `output_config`, so on a deployment that rejects
-that field it is dropped automatically along with native structured output.
+**Thinking is the latency lever.** Opus 5 runs adaptive thinking at effort `high`
+by default, which on a full podcast transcript thinks for minutes and exhausts
+`max_tokens` before the summary is complete. `BEDROCK_EFFORT` would cap that, but
+it travels inside `output_config` — the same field some deployments reject — so
+where that happens the model silently reverts to `high`. `BEDROCK_THINKING` is a
+**top-level** parameter and therefore always applies; it defaults to `disabled`,
+which suits this workload (extracting a fixed schema from a transcript is not a
+reasoning task — the OpenAI path this replaced used a non-thinking model). Set it
+to `adaptive` where latency is not the binding constraint.
+
+With thinking disabled, Opus 5 can occasionally write the tool call as visible
+text instead of a tool_use block; the reader recovers the payload from the text
+rather than failing a request the model actually answered.
 
 **Health check.** `GET /api/health/llm` makes one deliberately tiny structured
 call through the same chain and reports which provider and model answered — a

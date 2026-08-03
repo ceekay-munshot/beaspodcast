@@ -281,6 +281,49 @@ describe('callBedrockClaude — structured output fallback', () => {
   })
 })
 
+describe('callBedrockClaude — thinking control', () => {
+  it('disables thinking by default, top-level so it survives an output_config rejection', async () => {
+    // `effort` rides in output_config and is dropped on deployments that reject
+    // it — leaving Opus 5 at its default HIGH effort. `thinking` is top-level, so
+    // it is the only lever that always lands.
+    fetchMock.mockResolvedValueOnce(OUTPUT_CONFIG_REJECTED).mockResolvedValueOnce(toolOk())
+    await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'us-iso-east-1' })
+    const surviving = bodyOf(1)
+    expect(surviving).not.toHaveProperty('output_config') // effort lever gone…
+    expect(surviving.thinking).toEqual({ type: 'disabled' }) // …this one remains
+  })
+
+  it('can be switched back to adaptive thinking', async () => {
+    fetchMock.mockResolvedValueOnce(jsonSchemaOk())
+    await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'af-north-1', thinking: 'adaptive' })
+    expect(bodyOf(0).thinking).toEqual({ type: 'adaptive' })
+  })
+
+  it('recovers a tool payload the model wrote as plain text', async () => {
+    // A documented Opus 5 failure mode with thinking disabled: the tool call is
+    // emitted as visible text and no tool_use block is ever produced.
+    fetchMock.mockResolvedValueOnce(OUTPUT_CONFIG_REJECTED).mockResolvedValueOnce(
+      sseResponse([
+        frame({ type: 'content_block_start', content_block: { type: 'text' } }),
+        frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: '```json\n' + JSON.stringify(PAYLOAD) + '\n```' } }),
+        frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }),
+      ]),
+    )
+    const out = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'sa-west-1' })
+    expect(out.raw).toEqual(PAYLOAD)
+  })
+
+  it('names truncation as a budget problem rather than malformed JSON', async () => {
+    fetchMock.mockResolvedValueOnce(OUTPUT_CONFIG_REJECTED).mockResolvedValueOnce(
+      sseResponse([
+        frame({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'emit_summary' } }),
+        frame({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{"status":"ok","more":"unclosed' } }),
+      ]),
+    )
+    await expect(callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-south-3' })).rejects.toThrow(/cut off after \d+ chars/)
+  })
+})
+
 describe('callBedrockClaude — effort and timeout', () => {
   it('asks for low effort by default — Opus 5 would otherwise think at high', async () => {
     fetchMock.mockResolvedValueOnce(jsonSchemaOk())
