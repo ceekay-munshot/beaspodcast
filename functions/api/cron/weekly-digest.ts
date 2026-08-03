@@ -27,6 +27,11 @@ interface CronEnv {
   OPENAI_API_KEY?: string
   ANTHROPIC_API_KEY?: string
   SUMMARY_MODEL?: string
+  // Claude/Bedrock toggle — mirrors /api/summary; defaults to "openai".
+  LLM_PROVIDER?: string
+  temp_claude_token?: string
+  AWS_BEDROCK_REGION?: string
+  AWS_BEDROCK_MODEL_ID?: string
   // The deployed origin (e.g. https://podcast-afg.pages.dev) — required to build an
   // absolute, click-from-an-inbox link to the hosted PDF (a cron has no request).
   SITE_URL?: string
@@ -51,7 +56,16 @@ export const onRequest = async (context: { request: Request; env: CronEnv }): Pr
     const force = new URL(request.url).searchParams.get('force') === '1'
     const scheduleStore = env.SUMMARIES ? kvScheduleStore(env.SUMMARIES) : null
     const summaryStore = env.SUMMARIES ? kvSummaryStore(env.SUMMARIES) : undefined
-    const summarizeConfig = { openaiKey: env.OPENAI_API_KEY, anthropicKey: env.ANTHROPIC_API_KEY, model: env.SUMMARY_MODEL || undefined, store: summaryStore }
+    const summarizeConfig = {
+      openaiKey: env.OPENAI_API_KEY,
+      anthropicKey: env.ANTHROPIC_API_KEY,
+      model: env.SUMMARY_MODEL || undefined,
+      store: summaryStore,
+      llmProvider: env.LLM_PROVIDER === 'claude' ? ('claude' as const) : ('openai' as const),
+      bedrockKey: env.temp_claude_token,
+      bedrockRegion: env.AWS_BEDROCK_REGION || undefined,
+      bedrockModel: env.AWS_BEDROCK_MODEL_ID || undefined,
+    }
 
     // Auto-process the week, sustainably: on EVERY tick, summarise a bounded batch of
     // this week's pending episodes (writes to the shared store). Over the 30-min ticks

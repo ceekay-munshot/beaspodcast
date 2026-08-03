@@ -2,6 +2,7 @@ import type { EpisodeInsight, EpisodeTone, Highlight, Idea, InsightParty, QAItem
 import { stableHash } from '../src/lib/hash'
 import { transcribeEpisode } from './transcribe'
 import { SUMMARY_REVISION, sharedSummaryKey, type SummaryStore } from './summaryStore'
+import { DEFAULT_BEDROCK_MODEL, isBedrockClaudeSelected, viaBedrockClaude } from './bedrockClaude'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AI summarization — runtime-agnostic (Vite dev middleware + Cloudflare Pages
@@ -32,6 +33,15 @@ export interface SummarizeConfig {
   anthropicKey?: string
   /** Optional model override; otherwise a sensible per-provider default is used. */
   model?: string
+  /** Provider toggle — defaults to 'openai' so existing deployments are unaffected.
+   *  Set to 'claude' (together with `bedrockKey`) to route through AWS Bedrock
+   *  instead of OpenAI. See bedrockClaude.ts. */
+  llmProvider?: 'openai' | 'claude'
+  /** AWS Bedrock bearer key. Only used when llmProvider === 'claude'. */
+  bedrockKey?: string
+  /** Optional Bedrock region/model overrides; otherwise bedrockClaude.ts defaults apply. */
+  bedrockRegion?: string
+  bedrockModel?: string
   // Transcription providers (threaded to the transcribe chain):
   deepgramKey?: string // URL-based, handles long episodes
   deepgramModel?: string
@@ -498,8 +508,11 @@ const cache = new Map<string, SummarizeResult>()
 
 export async function summarizeEpisode(input: SummarizeInput, config: SummarizeConfig): Promise<SummarizeResult> {
   const provider = config.openaiKey ? 'openai' : config.anthropicKey ? 'anthropic' : null
-  if (!provider) throw new Error('no_api_key')
-  const model = config.model || (provider === 'openai' ? DEFAULT_OPENAI_MODEL : DEFAULT_ANTHROPIC_MODEL)
+  const useBedrockClaude = isBedrockClaudeSelected(config)
+  if (!provider && !useBedrockClaude) throw new Error('no_api_key')
+  const model = useBedrockClaude
+    ? config.bedrockModel || DEFAULT_BEDROCK_MODEL
+    : config.model || (provider === 'openai' ? DEFAULT_OPENAI_MODEL : DEFAULT_ANTHROPIC_MODEL)
 
   // Shared, persistent cache (KV in prod, filesystem in dev), keyed by the stable
   // episode id: the FIRST user to open an episode pays the transcription + LLM
@@ -526,13 +539,15 @@ export async function summarizeEpisode(input: SummarizeInput, config: SummarizeC
   // shadows the correct L2 entry. The weekly roundup passes a content-derived
   // `weekly:<hash>` id (so it's shared like episodes); any truly id-less call falls
   // back to a hash of its show+notes so distinct inputs still get distinct slots.
-  const idPart = input.id ?? `n:${stableHash(`${input.show} ${input.notes ?? ''}`)}`
-  const cacheKey = `${provider}:${model}:${transcript ? 't' : 'n'}:r${SUMMARY_REVISION}::${idPart}`
+  const idPart = input.id ?? `n:${stableHash(`${input.show} ${input.notes ?? ''}`)}`
+  const providerTag = useBedrockClaude ? 'bedrock-claude' : provider
+  const cacheKey = `${providerTag}:${model}:${transcript ? 't' : 'n'}:r${SUMMARY_REVISION}::${idPart}`
   const hit = input.force ? undefined : cache.get(cacheKey)
   if (hit) return hit
 
-  const raw =
-    provider === 'openai'
+  const raw = useBedrockClaude
+    ? await viaBedrockClaude(prompt, config.bedrockKey as string, model, SCHEMA, config.bedrockRegion)
+    : provider === 'openai'
       ? await viaOpenAI(prompt, config.openaiKey as string, model, SCHEMA)
       : await viaAnthropic(prompt, config.anthropicKey as string, model, SCHEMA)
   const summary = normalize(raw as RawSummary)
@@ -790,9 +805,12 @@ export interface SynthesizeWeeklyInput {
  *  no LLM key is configured (callers fall back to the deterministic base). */
 export async function synthesizeWeekly(input: SynthesizeWeeklyInput, config: SummarizeConfig): Promise<WeeklyAi | null> {
   const provider = config.openaiKey ? 'openai' : config.anthropicKey ? 'anthropic' : null
-  if (!provider) return null
+  const useBedrockClaude = isBedrockClaudeSelected(config)
+  if (!provider && !useBedrockClaude) return null
   if (!input.sources.length) return null
-  const model = config.model || (provider === 'openai' ? DEFAULT_OPENAI_MODEL : DEFAULT_ANTHROPIC_MODEL)
+  const model = useBedrockClaude
+    ? config.bedrockModel || DEFAULT_BEDROCK_MODEL
+    : config.model || (provider === 'openai' ? DEFAULT_OPENAI_MODEL : DEFAULT_ANTHROPIC_MODEL)
 
   // Shared-store reuse: the SAME episode-set (same id) is synthesised once total —
   // a browser visit and the Monday cron reuse each other's result.
@@ -803,8 +821,9 @@ export async function synthesizeWeekly(input: SynthesizeWeeklyInput, config: Sum
   }
 
   const prompt = { system: WEEKLY_SYSTEM, user: buildWeeklyUser(input.range, input.sources) }
-  const raw =
-    provider === 'openai'
+  const raw = useBedrockClaude
+    ? await viaBedrockClaude(prompt, config.bedrockKey as string, model, WEEKLY_SCHEMA, config.bedrockRegion)
+    : provider === 'openai'
       ? await viaOpenAI(prompt, config.openaiKey as string, model, WEEKLY_SCHEMA)
       : await viaAnthropic(prompt, config.anthropicKey as string, model, WEEKLY_SCHEMA)
   const ai = normalizeWeeklyAi(raw)

@@ -7,9 +7,26 @@ import { kvSummaryStore, type KVNamespace } from '../../server/summaryStore'
 // auto-detected by which key is present. Mirrors the Vite dev middleware.
 // SUMMARIES (a KV namespace binding) is the shared, persistent summary cache:
 // when bound, a processed episode is reused across all users instead of recomputed.
+//
+// LLM_PROVIDER (optional, defaults to "openai") — set to "claude" to route
+// through AWS Bedrock instead, using the `temp_claude_token` secret as the
+// Bedrock bearer key (see server/bedrockClaude.ts). AWS_BEDROCK_REGION /
+// AWS_BEDROCK_MODEL_ID optionally override the region/model defaults.
 export const onRequestPost = async (context: {
   request: Request
-  env: { OPENAI_API_KEY?: string; ANTHROPIC_API_KEY?: string; SUMMARY_MODEL?: string; GROQ_API_KEY?: string; DEEPGRAM_API_KEY?: string; DEEPGRAM_MODEL?: string; SUMMARIES?: KVNamespace }
+  env: {
+    OPENAI_API_KEY?: string
+    ANTHROPIC_API_KEY?: string
+    SUMMARY_MODEL?: string
+    GROQ_API_KEY?: string
+    DEEPGRAM_API_KEY?: string
+    DEEPGRAM_MODEL?: string
+    SUMMARIES?: KVNamespace
+    LLM_PROVIDER?: string
+    temp_claude_token?: string
+    AWS_BEDROCK_REGION?: string
+    AWS_BEDROCK_MODEL_ID?: string
+  }
 }): Promise<Response> => {
   const config = {
     openaiKey: context.env?.OPENAI_API_KEY,
@@ -20,10 +37,15 @@ export const onRequestPost = async (context: {
     groqKey: context.env?.GROQ_API_KEY, // free-tier Whisper (short episodes)
     // Shared cache — absent binding degrades gracefully to per-request compute.
     store: context.env?.SUMMARIES ? kvSummaryStore(context.env.SUMMARIES) : undefined,
+    // Claude/Bedrock toggle — defaults to "openai" so existing deployments are unaffected.
+    llmProvider: context.env?.LLM_PROVIDER === 'claude' ? ('claude' as const) : ('openai' as const),
+    bedrockKey: context.env?.temp_claude_token,
+    bedrockRegion: context.env?.AWS_BEDROCK_REGION || undefined,
+    bedrockModel: context.env?.AWS_BEDROCK_MODEL_ID || undefined,
   }
   const headers = { 'content-type': 'application/json' }
 
-  if (!config.openaiKey && !config.anthropicKey) {
+  if (!config.openaiKey && !config.anthropicKey && !(config.llmProvider === 'claude' && config.bedrockKey)) {
     return new Response(JSON.stringify({ error: 'no_api_key' }), { status: 503, headers })
   }
 

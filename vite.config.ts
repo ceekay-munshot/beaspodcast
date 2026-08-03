@@ -60,6 +60,10 @@ function liveApiPlugin(config: {
   emailToken?: string
   siteUrl?: string
   emailAttachments?: boolean
+  llmProvider?: 'openai' | 'claude'
+  bedrockKey?: string
+  bedrockRegion?: string
+  bedrockModel?: string
 }): Plugin {
   // Shared summary store for dev: a filesystem mirror of the prod KV namespace, so
   // a summary generated once is reused across reloads and across every browser that
@@ -267,7 +271,7 @@ function liveApiPlugin(config: {
 
       server.middlewares.use('/api/summary', async (req, res) => {
         if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' })
-        if (!config.openaiKey && !config.anthropicKey) return json(res, 503, { error: 'no_api_key' })
+        if (!config.openaiKey && !config.anthropicKey && !(config.llmProvider === 'claude' && config.bedrockKey)) return json(res, 503, { error: 'no_api_key' })
         try {
           const input = JSON.parse((await readBody(req)) || '{}')
           if (input.mode === 'weekly') {
@@ -300,6 +304,11 @@ export default defineConfig(({ mode }) => {
     emailToken: pick('MUNSHOT_EMAIL_TOKEN') || undefined, // service token for server-side sends
     siteUrl: pick('SITE_URL') || undefined, // absolute origin for hosted-PDF links
     emailAttachments: pick('EMAIL_ATTACHMENTS') === '1', // attach the weekly PDF (endpoint must support it)
+    // Claude/Bedrock toggle (see server/bedrockClaude.ts) — defaults to "openai".
+    llmProvider: (pick('LLM_PROVIDER') === 'claude' ? 'claude' : 'openai') as 'openai' | 'claude',
+    bedrockKey: pick('temp_claude_token') || undefined,
+    bedrockRegion: pick('AWS_BEDROCK_REGION') || undefined,
+    bedrockModel: pick('AWS_BEDROCK_MODEL_ID') || undefined,
   }
 
   return {
