@@ -166,9 +166,13 @@ the Worker `env` binding and is only ever used inside the Worker — client-side
 calls `/api/summary`, never Bedrock directly.
 
 Bedrock grants model access per AWS account, so the transport walks a chain —
-`anthropic.claude-opus-5` → `anthropic.claude-opus-4-8` →
-`anthropic.claude-sonnet-5` — and pins the first model that answers (a 403 on
-Opus 5 is expected, not an error). It likewise tries native `output_config`
+`anthropic.claude-sonnet-5` → `anthropic.claude-haiku-4-5` →
+`anthropic.claude-opus-4-8` — and pins the first model that answers (a 403 is
+expected, not an error). **Sonnet 5 leads on purpose:** this workload is
+generation-bound, not reasoning-bound — a fixed schema extracted from a
+transcript into several thousand tokens — and Opus 5 measured 107s+ on it, past
+any sensible request budget even with thinking disabled. Pin the heavier model
+with `AWS_BEDROCK_MODEL_ID=anthropic.claude-opus-5` where latency doesn't matter. It likewise tries native `output_config`
 structured output first and falls back to forced single-tool use, pinning
 whichever the deployment accepts.
 

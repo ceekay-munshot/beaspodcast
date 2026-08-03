@@ -109,6 +109,11 @@ describe('callBedrockClaude — endpoint and auth', () => {
   it('uses anthropic.-prefixed model ids', () => {
     for (const model of BEDROCK_MODEL_CHAIN) expect(model.startsWith('anthropic.')).toBe(true)
   })
+
+  it('leads with a generation-fast model — Opus 5 could not finish this payload in time', () => {
+    expect(BEDROCK_MODEL_CHAIN[0]).toBe('anthropic.claude-sonnet-5')
+    expect(BEDROCK_MODEL_CHAIN).not.toContain('anthropic.claude-opus-5')
+  })
 })
 
 describe('callBedrockClaude — streaming (Workers runtime)', () => {
@@ -205,15 +210,15 @@ describe('callBedrockClaude — streaming (Workers runtime)', () => {
 })
 
 describe('callBedrockClaude — model access fallback chain', () => {
-  it('falls through a 403 on Opus 5 to the next model in the chain', async () => {
+  it('falls through a 403 on the lead model to the next in the chain', async () => {
     fetchMock
-      .mockResolvedValueOnce(err(403, 'not authorized to invoke this model')) // opus-5
-      .mockResolvedValueOnce(jsonSchemaOk()) // opus-4-8
+      .mockResolvedValueOnce(err(403, 'not authorized to invoke this model')) // lead model
+      .mockResolvedValueOnce(jsonSchemaOk()) // next in chain
     const out = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-south-1' })
 
-    expect(bodyOf(0).model).toBe('anthropic.claude-opus-5')
-    expect(bodyOf(1).model).toBe('anthropic.claude-opus-4-8')
-    expect(out.model).toBe('anthropic.claude-opus-4-8')
+    expect(bodyOf(0).model).toBe(BEDROCK_MODEL_CHAIN[0])
+    expect(bodyOf(1).model).toBe(BEDROCK_MODEL_CHAIN[1])
+    expect(out.model).toBe(BEDROCK_MODEL_CHAIN[1])
     expect(out.raw).toEqual(PAYLOAD)
   })
 
@@ -227,8 +232,8 @@ describe('callBedrockClaude — model access fallback chain', () => {
     fetchMock.mockResolvedValueOnce(jsonSchemaOk())
     const second = await callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'sa-east-1' })
     expect(fetchMock).toHaveBeenCalledTimes(3) // one call, straight to the pinned model
-    expect(bodyOf(2).model).toBe('anthropic.claude-opus-4-8')
-    expect(second.model).toBe('anthropic.claude-opus-4-8')
+    expect(bodyOf(2).model).toBe(BEDROCK_MODEL_CHAIN[1])
+    expect(second.model).toBe(BEDROCK_MODEL_CHAIN[1])
   })
 
   it('throws when no model in the chain is reachable', async () => {
@@ -399,7 +404,7 @@ describe('probeLlm — health check', () => {
     fetchMock.mockResolvedValueOnce(jsonSchemaOk())
     const out = await probeLlm({ bedrockKey: 'k', bedrockRegion: 'af-south-1' })
     expect(out.provider).toBe('bedrock')
-    expect(out.model).toBe('anthropic.claude-opus-5')
+    expect(out.model).toBe(BEDROCK_MODEL_CHAIN[0])
     expect(out.chain).toEqual(['bedrock'])
   })
 

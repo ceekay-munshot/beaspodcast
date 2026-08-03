@@ -33,13 +33,21 @@
 export const DEFAULT_BEDROCK_REGION = 'us-east-1'
 
 /** Tried in order — the first model that answers is pinned for the isolate's life.
- *  Bedrock grants model access per ACCOUNT, so Opus 5 commonly returns 403 while
- *  Opus 4.8 and Sonnet 5 are open to all Bedrock customers. Hence a chain rather
- *  than a single id: a 403 is an expected, recoverable outcome here, not an error. */
+ *  The chain covers two failure modes at once: Bedrock grants model access per
+ *  ACCOUNT (a 403 is expected, not an error), and models differ enormously in how
+ *  fast they emit a large structured payload.
+ *
+ *  Sonnet 5 leads deliberately. This workload extracts a fixed schema from a
+ *  transcript into a payload of several thousand tokens; that is generation-bound,
+ *  not reasoning-bound, and Opus 5 measured 107s+ on it — past any sensible
+ *  request budget even with thinking disabled. Sonnet 5 is far quicker at the same
+ *  extraction and remains a clear step up from the gpt-4o-mini this replaced.
+ *  Set AWS_BEDROCK_MODEL_ID=anthropic.claude-opus-5 to pin the heavier model where
+ *  latency does not matter. */
 export const BEDROCK_MODEL_CHAIN = [
-  'anthropic.claude-opus-5',
-  'anthropic.claude-opus-4-8',
   'anthropic.claude-sonnet-5',
+  'anthropic.claude-haiku-4-5',
+  'anthropic.claude-opus-4-8',
 ] as const
 
 /** How the structured JSON is requested. `json_schema` is the native structured-
@@ -368,7 +376,17 @@ export async function callBedrockClaude(
 
       if (res.ok) {
         try {
-          const raw = await readStructuredStream(res, attempt.mode)
+          // The deadline also covers the read: a model that connects promptly but
+          // generates slowly aborts here, not in fetch(), and must still be named
+          // a timeout rather than surfacing a bare AbortError.
+          const raw = await readStructuredStream(res, attempt.mode).catch((e: unknown) => {
+            if ((e as { name?: string })?.name === 'AbortError') {
+              throw new Error(
+                `bedrock: timed out after ${Math.round(timeoutMs / 1000)}s while generating (${model}/${attempt.mode}) — use a faster model via AWS_BEDROCK_MODEL_ID`,
+              )
+            }
+            throw e
+          })
           pins.set(key, {
             // Merge, don't replace: a preceding attempt may have already proven
             // output_config unusable, and that verdict must survive the success.
