@@ -58,6 +58,8 @@ export interface SummarizeConfig {
   bedrockEffort?: string
   /** 'disabled' (default) or 'adaptive' — see bedrockClaude.ts. */
   bedrockThinking?: string
+  /** Per-attempt deadline in ms — see bedrockClaude.ts. */
+  bedrockTimeoutMs?: number
   // Transcription providers (threaded to the transcribe chain):
   deepgramKey?: string // URL-based, handles long episodes
   deepgramModel?: string
@@ -147,6 +149,7 @@ async function runStructured(prompt: { system: string; user: string }, schema: o
           model: config.bedrockModel,
           effort: config.bedrockEffort,
           thinking: config.bedrockThinking,
+          timeoutMs: config.bedrockTimeoutMs,
           maxTokens,
         })
         return { raw: out.raw, provider, model: out.model, structuredMode: out.structuredMode }

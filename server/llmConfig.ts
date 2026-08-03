@@ -36,6 +36,10 @@ export interface LlmEnv {
    *  summary inside the request budget on deployments that reject output_config
    *  (and therefore ignore BEDROCK_EFFORT). */
   BEDROCK_THINKING?: string
+  /** Per-attempt deadline in ms. Default 240000. A transcript-grade summary is
+   *  several thousand tokens of generation, so this must be generous — too low a
+   *  value aborts healthy requests mid-payload. */
+  BEDROCK_TIMEOUT_MS?: string
   /** Legacy name the Bedrock key was first deployed under — still honoured so an
    *  existing deployment keeps working after this rename. Prefer BEDROCK_API_KEY. */
   temp_claude_token?: string
@@ -43,7 +47,7 @@ export interface LlmEnv {
 
 export type LlmConfig = Pick<
   SummarizeConfig,
-  'openaiKey' | 'anthropicKey' | 'model' | 'llmProvider' | 'bedrockKey' | 'bedrockRegion' | 'bedrockModel' | 'bedrockEffort' | 'bedrockThinking'
+  'openaiKey' | 'anthropicKey' | 'model' | 'llmProvider' | 'bedrockKey' | 'bedrockRegion' | 'bedrockModel' | 'bedrockEffort' | 'bedrockThinking' | 'bedrockTimeoutMs'
 >
 
 export function llmConfigFromEnv(env: LlmEnv | undefined): LlmConfig {
@@ -58,6 +62,7 @@ export function llmConfigFromEnv(env: LlmEnv | undefined): LlmConfig {
     bedrockModel: e.AWS_BEDROCK_MODEL_ID || undefined,
     bedrockEffort: e.BEDROCK_EFFORT || undefined,
     bedrockThinking: e.BEDROCK_THINKING || undefined,
+    bedrockTimeoutMs: Number(e.BEDROCK_TIMEOUT_MS) || undefined,
   }
 }
 

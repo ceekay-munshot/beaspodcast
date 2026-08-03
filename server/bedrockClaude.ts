@@ -86,9 +86,12 @@ const DEFAULT_EFFORT = 'low'
  *  on where latency is not the binding constraint. */
 const DEFAULT_THINKING = 'disabled'
 
-/** Fail loudly rather than hang. Chosen to land inside the edge's own request
- *  budget so the caller sees a timeout instead of a dropped connection. */
-const DEFAULT_TIMEOUT_MS = 100_000
+/** Fail loudly rather than hang — but only well past the point a healthy request
+ *  would have finished. An earlier run returned a complete response end-to-end at
+ *  149s, so the platform tolerates far more than the original 100s cap, which was
+ *  aborting healthy generations mid-payload and reporting them as broken JSON.
+ *  Override with BEDROCK_TIMEOUT_MS. */
+const DEFAULT_TIMEOUT_MS = 240_000
 
 export interface BedrockCallOptions {
   /** The Bedrock API key. Read from the Worker `env` binding by the caller —
@@ -221,7 +224,7 @@ function attemptsFor(pin: Pin, effort?: string): Attempt[] {
  * frame boundaries, so `buffer` holds the trailing partial line until the rest of
  * it arrives.
  */
-async function readStructuredStream(res: Response, mode: StructuredMode): Promise<unknown> {
+async function readStructuredStream(res: Response, mode: StructuredMode, model = 'unknown'): Promise<unknown> {
   const reader = res.body?.getReader()
   if (!reader) throw new Error('bedrock: streamed response had no readable body')
 
@@ -301,11 +304,15 @@ async function readStructuredStream(res: Response, mode: StructuredMode): Promis
   } catch {
     // A payload that starts as valid JSON but does not close is a truncation,
     // which is a budget problem, not a malformed-response problem — say which.
-    const looksTruncated = raw.trimStart().startsWith('{') && !raw.trimEnd().endsWith('}')
+    // Anything that opened as a JSON object but won't parse is incomplete, not
+    // malformed — a cut inside a nested object still ends in '}', so the closing
+    // brace proves nothing. Report the length and the stop reason: that is what
+    // distinguishes "ran out of tokens" from "ran out of time".
+    const startedAsJson = raw.trimStart().startsWith('{')
     throw new Error(
-      looksTruncated
-        ? `bedrock: ${mode} payload was cut off after ${raw.length} chars — raise max_tokens, lower effort, or disable thinking`
-        : `bedrock: streamed ${mode} payload was not valid JSON${recoveredFromText ? ' (recovered from text, not a tool_use block)' : ''}`,
+      startedAsJson
+        ? `bedrock: ${model} ${mode} payload incomplete — ${raw.length} chars, stop_reason=${stopReason ?? 'none (stream ended early)'}. Raise BEDROCK_TIMEOUT_MS or max_tokens.`
+        : `bedrock: ${model} streamed ${mode} payload was not valid JSON${recoveredFromText ? ' (recovered from text, not a tool_use block)' : ''}`,
     )
   }
 }
@@ -379,7 +386,7 @@ export async function callBedrockClaude(
           // The deadline also covers the read: a model that connects promptly but
           // generates slowly aborts here, not in fetch(), and must still be named
           // a timeout rather than surfacing a bare AbortError.
-          const raw = await readStructuredStream(res, attempt.mode).catch((e: unknown) => {
+          const raw = await readStructuredStream(res, attempt.mode, model).catch((e: unknown) => {
             if ((e as { name?: string })?.name === 'AbortError') {
               throw new Error(
                 `bedrock: timed out after ${Math.round(timeoutMs / 1000)}s while generating (${model}/${attempt.mode}) — use a faster model via AWS_BEDROCK_MODEL_ID`,

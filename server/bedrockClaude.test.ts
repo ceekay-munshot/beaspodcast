@@ -318,14 +318,16 @@ describe('callBedrockClaude — thinking control', () => {
     expect(out.raw).toEqual(PAYLOAD)
   })
 
-  it('names truncation as a budget problem rather than malformed JSON', async () => {
+  it('names an incomplete payload as incomplete even when it ends in a brace', async () => {
     fetchMock.mockResolvedValueOnce(OUTPUT_CONFIG_REJECTED).mockResolvedValueOnce(
       sseResponse([
         frame({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'emit_summary' } }),
-        frame({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{"status":"ok","more":"unclosed' } }),
+        // Cut inside a nested object, so it ends with '}' — the naive
+        // "does it close?" check called this malformed and hid a budget problem.
+        frame({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{"qa":[{"q":"a","a":"b"}' } }),
       ]),
     )
-    await expect(callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-south-3' })).rejects.toThrow(/cut off after \d+ chars/)
+    await expect(callBedrockClaude(PROMPT, SCHEMA, { apiKey: 'k', region: 'ap-south-3' })).rejects.toThrow(/payload incomplete — \d+ chars/)
   })
 })
 

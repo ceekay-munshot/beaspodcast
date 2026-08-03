@@ -156,6 +156,7 @@ in turn — if the primary fails, the next one runs on the same request.
 | `AWS_BEDROCK_MODEL_ID` | Pin one model instead of walking the fallback chain. Ids carry the `anthropic.` prefix. |
 | `BEDROCK_EFFORT` | Thinking depth: `low` (default) \| `medium` \| `high` \| `xhigh` \| `max`. Only applies where `output_config` is accepted. |
 | `BEDROCK_THINKING` | `disabled` (default) \| `adaptive`. Top-level, so it always applies — the reliable latency lever. |
+| `BEDROCK_TIMEOUT_MS` | Per-attempt deadline, default `240000`. Too low aborts healthy generations mid-payload. |
 | `LLM_PROVIDER` | Force one provider to the front: `bedrock` \| `openai` \| `anthropic`. Set to `openai` to switch back. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` + `SUMMARY_MODEL` | Fallback providers, unchanged. |
 
